@@ -2,6 +2,7 @@
 mod layer_shell;
 
 mod config;
+mod lpk;
 mod tray;
 
 use std::sync::Mutex;
@@ -112,8 +113,32 @@ fn add_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
     if !p.exists() {
         return Err("File not found".to_string());
     }
-    config::add_model(&app, &path);
+
+    let model_path = match p.extension().and_then(|e| e.to_str()) {
+        Some("lpk") => extract_lpk(&app, &path)?,
+        Some("json") => path,
+        _ => return Err("Unsupported format. Use .lpk or .model3.json".to_string()),
+    };
+
+    config::add_model(&app, &model_path);
     Ok(())
+}
+
+fn extract_lpk(app: &tauri::AppHandle, lpk_path: &str) -> Result<String, String> {
+    let lpk = std::path::Path::new(lpk_path);
+    let stem = lpk
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("Invalid file name")?;
+
+    let models_dir = app
+        .path()
+        .app_data_dir()
+        .expect("Failed to get app data dir")
+        .join("models")
+        .join(stem);
+
+    lpk::extract_lpk(&models_dir, lpk_path)
 }
 
 #[tauri::command]

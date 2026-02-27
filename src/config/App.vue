@@ -19,7 +19,10 @@ async function refreshConfig() {
 async function importModel() {
   const selected = await open({
     multiple: false,
-    filters: [{ name: 'Live2D Model', extensions: ['json'] }],
+    filters: [
+      { name: 'Live2D Package', extensions: ['lpk'] },
+      { name: 'Live2D Model JSON', extensions: ['json'] },
+    ],
   });
   if (selected) {
     await invoke('add_model', { path: selected });
