@@ -4,30 +4,33 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Rive2d Settings</title>
-  <link rel="stylesheet" href="config.css" />
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: #1e1e2e;
+      color: #cdd6f4;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    #app-error {
+      padding: 24px;
+      color: #f38ba8;
+      white-space: pre-wrap;
+      font-size: 13px;
+      display: none;
+    }
+  </style>
 </head>
 <body>
-  <div class="container">
-    <h1>Rive2d Settings</h1>
-
-    <div class="section">
-      <label>Current Model</label>
-      <div class="model-path">
-        <input type="text" id="model-path" readonly placeholder="No model selected" />
-        <button id="browse-btn">Browse</button>
-      </div>
-    </div>
-
-    <div class="section">
-      <label>Recent Models</label>
-      <ul id="recent-list" class="recent-list"></ul>
-    </div>
-
-    <div class="actions">
-      <button id="apply-btn" class="primary" disabled>Apply</button>
-    </div>
-  </div>
-
-  <script type="module" src="config.js"></script>
+  <div id="app"></div>
+  <div id="app-error"></div>
+  <script type="module">
+    import('./config/main.js').catch(err => {
+      const el = document.getElementById('app-error');
+      el.style.display = 'block';
+      el.textContent = 'Failed to load config app:\n' + err.message + '\n' + err.stack;
+    });
+  </script>
 </body>
 </html>

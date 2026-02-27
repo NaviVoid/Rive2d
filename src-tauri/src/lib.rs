@@ -13,15 +13,29 @@ pub struct PetWindowState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Fix blank WebKitGTK windows on some Wayland compositors (e.g. Niri)
+    #[cfg(target_os = "linux")]
+    unsafe {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(PetWindowState { initialized: false }))
-        .invoke_handler(tauri::generate_handler![load_model, get_config, apply_model])
+        .invoke_handler(tauri::generate_handler![
+            load_model,
+            get_config,
+            apply_model,
+            add_model,
+            remove_model
+        ])
         .setup(|app| {
             let handle = app.handle().clone();
             tray::setup_tray(&handle)?;
 
             let cfg = config::load(&handle);
+            eprintln!("[rive2d] current_model = {:?}", cfg.current_model);
+            eprintln!("[rive2d] models = {:?}", cfg.models);
             if let Some(ref model_path) = cfg.current_model {
                 // Has saved model: launch pet window immediately
                 #[cfg(target_os = "linux")]
@@ -52,25 +66,32 @@ pub fn run() {
 }
 
 pub fn create_config_window(app: &tauri::AppHandle) {
-    // If already exists, just show and focus it
     if let Some(window) = app.get_webview_window("config") {
         window.show().ok();
         window.set_focus().ok();
         return;
     }
 
-    let config_window = tauri::WebviewWindowBuilder::new(
-        app,
-        "config",
-        tauri::WebviewUrl::App("config.html".into()),
-    )
-    .title("Rive2d Settings")
-    .inner_size(480.0, 400.0)
-    .resizable(false)
-    .build()
-    .expect("Failed to create config window");
+    // Build the config page URL
+    let url = {
+        let dev_url = &app.config().build.dev_url;
+        if let Some(base) = dev_url {
+            let full = format!("{}config.html", base);
+            eprintln!("[rive2d] Config window URL: {}", full);
+            tauri::WebviewUrl::External(full.parse().unwrap())
+        } else {
+            eprintln!("[rive2d] Config window URL: tauri://localhost/config.html");
+            tauri::WebviewUrl::App("config.html".into())
+        }
+    };
 
-    // Hide instead of destroy on close
+    let config_window = tauri::WebviewWindowBuilder::new(app, "config", url)
+        .title("Rive2d Settings")
+        .inner_size(480.0, 400.0)
+        .resizable(false)
+        .build()
+        .expect("Failed to create config window");
+
     let win = config_window.clone();
     config_window.on_window_event(move |event| {
         if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -86,11 +107,24 @@ fn get_config(app: tauri::AppHandle) -> config::AppConfig {
 }
 
 #[tauri::command]
+fn add_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err("File not found".to_string());
+    }
+    config::add_model(&app, &path);
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    config::remove_model(&app, &path);
+    Ok(())
+}
+
+#[tauri::command]
 async fn apply_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    // Save config
-    let mut cfg = config::load(&app);
-    config::set_model(&mut cfg, &path);
-    config::save(&app, &cfg);
+    config::set_model(&app, &path);
 
     // Initialize layer shell if not yet done
     let needs_init = {

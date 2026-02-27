@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.rive2d.desktop-pet",
   "build": {
-    "devUrl": "http://localhost:1420",
+    "devUrl": "http://127.0.0.1:1420",
     "frontendDist": "../dist",
     "beforeDevCommand": "vite",
     "beforeBuildCommand": "vite build"
