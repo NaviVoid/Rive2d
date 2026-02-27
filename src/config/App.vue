@@ -5,12 +5,14 @@ import { open } from '@tauri-apps/plugin-dialog';
 
 const models = ref([]);
 const currentModel = ref(null);
+const showBorder = ref(false);
 
 async function refreshConfig() {
   try {
     const config = await invoke('get_config');
     models.value = config.models;
     currentModel.value = config.current_model;
+    showBorder.value = config.show_border;
   } catch (err) {
     console.error('Failed to load config:', err);
   }
@@ -38,6 +40,14 @@ async function loadModel(path) {
 async function removeModel(path) {
   await invoke('remove_model', { path });
   await refreshConfig();
+}
+
+async function toggleBorder() {
+  showBorder.value = !showBorder.value;
+  await invoke('set_setting', {
+    key: 'show_border',
+    value: showBorder.value ? 'true' : 'false',
+  });
 }
 
 function fileName(path) {
@@ -83,6 +93,15 @@ onMounted(refreshConfig);
       <p>No models imported yet.</p>
       <p class="hint">Click "Import Model" to add a Live2D model file.</p>
     </section>
+
+    <footer>
+      <div class="setting-row" @click="toggleBorder">
+        <span class="setting-label">Show debug border</span>
+        <div class="toggle" :class="{ on: showBorder }">
+          <div class="toggle-knob" />
+        </div>
+      </div>
+    </footer>
   </div>
 </template>
 
@@ -238,5 +257,52 @@ button {
 .hint {
   font-size: 12px;
   color: #585b70;
+}
+
+footer {
+  border-top: 1px solid #313244;
+  padding-top: 16px;
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  padding: 8px 0;
+  user-select: none;
+}
+
+.setting-label {
+  font-size: 13px;
+  color: #a6adc8;
+}
+
+.toggle {
+  width: 36px;
+  height: 20px;
+  background: #45475a;
+  border-radius: 10px;
+  position: relative;
+  transition: background 0.2s;
+}
+
+.toggle.on {
+  background: #89b4fa;
+}
+
+.toggle-knob {
+  width: 16px;
+  height: 16px;
+  background: #cdd6f4;
+  border-radius: 50%;
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  transition: transform 0.2s;
+}
+
+.toggle.on .toggle-knob {
+  transform: translateX(16px);
 }
 </style>

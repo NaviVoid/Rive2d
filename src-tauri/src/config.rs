@@ -7,6 +7,7 @@ use tauri::Manager;
 pub struct AppConfig {
     pub current_model: Option<String>,
     pub models: Vec<String>,
+    pub show_border: bool,
 }
 
 fn db_path(app: &tauri::AppHandle) -> PathBuf {
@@ -56,9 +57,19 @@ pub fn load(app: &tauri::AppHandle) -> AppConfig {
         .filter_map(|r| r.ok())
         .collect();
 
+    let show_border: bool = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'show_border'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     AppConfig {
         current_model,
         models,
+        show_border,
     }
 }
 
@@ -85,6 +96,15 @@ pub fn remove_model(app: &tauri::AppHandle, path: &str) {
         conn.execute("DELETE FROM config WHERE key = 'current_model'", [])
             .ok();
     }
+}
+
+pub fn set_setting(app: &tauri::AppHandle, key: &str, value: &str) {
+    let conn = open_db(app);
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+        [key, value],
+    )
+    .ok();
 }
 
 pub fn set_model(app: &tauri::AppHandle, path: &str) {

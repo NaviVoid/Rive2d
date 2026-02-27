@@ -11,6 +11,12 @@ const MANIFEST_NAME: &str = "config.mlve";
 /// Handles both regular (unencrypted) LPK files and Live2DViewerEX-style
 /// encrypted LPK files (STM_1_0 / STD_1_0 / STD_2_0 formats).
 pub fn extract_lpk(dest_dir: &Path, lpk_path: &str) -> Result<String, String> {
+    // Clean destination directory to avoid stale files from previous extractions
+    if dest_dir.exists() {
+        std::fs::remove_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+
     let file = std::fs::File::open(lpk_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
 
@@ -167,26 +173,37 @@ fn extract_encrypted_lpk(
         std::fs::write(&out_path, &data).map_err(|e| e.to_string())?;
     }
 
-    // Find the costume file (which is the model3.json) and rename it
+    // Find the costume file (model descriptor) and save with correct extension
     let mut model_json_path = None;
     for character in &manifest.list {
         for costume in &character.costume {
             if let Some(renamed) = rename_map.get(&costume.path) {
                 let src = dest_dir.join(renamed);
                 if src.exists() {
-                    // Read the model3.json and rewrite file references
+                    // Read the model descriptor and rewrite file references
                     let mut content =
                         std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
                     for (old_name, new_name) in &rename_map {
                         content = content.replace(old_name.as_str(), new_name.as_str());
                     }
 
-                    // Write as .model3.json
+                    // Detect Cubism version from content to use correct extension
+                    // Cubism 4/3: has "Version" and "FileReferences"
+                    // Cubism 2: has "model" and "textures"
+                    let is_cubism3plus = content.contains("\"FileReferences\"")
+                        || content.contains("\"Version\"");
+                    let ext = if is_cubism3plus {
+                        "model3.json"
+                    } else {
+                        "model.json"
+                    };
+
                     let model_name = manifest
                         .name
                         .as_deref()
                         .unwrap_or("model");
-                    let model_filename = format!("{}.model3.json", sanitize_filename(model_name));
+                    let model_filename =
+                        format!("{}.{}", sanitize_filename(model_name), ext);
                     let model_path = dest_dir.join(&model_filename);
                     std::fs::write(&model_path, &content).map_err(|e| e.to_string())?;
 
@@ -266,11 +283,15 @@ fn detect_extension(data: &[u8]) -> &'static str {
             return "jpg";
         }
     }
-    // Try to detect JSON
+    // Try to detect text-based formats
     if let Ok(text) = std::str::from_utf8(data) {
         let trimmed = text.trim_start();
         if trimmed.starts_with('{') || trimmed.starts_with('[') {
             return "json";
+        }
+        // Cubism 2 motion files start with "# Live2D Animator"
+        if trimmed.starts_with("# Live2D") {
+            return "mtn";
         }
     }
     "bin"

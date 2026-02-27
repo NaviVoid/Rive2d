@@ -22,13 +22,52 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .register_uri_scheme_protocol("model", |_ctx, request| {
+            // Serve model files from the filesystem via model:// protocol
+            let uri = request.uri().to_string();
+            // URI format: model://localhost/<absolute-path>
+            let path = uri
+                .strip_prefix("model://localhost/")
+                .or_else(|| uri.strip_prefix("model://localhost"))
+                .unwrap_or("");
+            let path = percent_encoding::percent_decode_str(path)
+                .decode_utf8_lossy()
+                .to_string();
+
+            let file_path = std::path::Path::new(&path);
+            match std::fs::read(file_path) {
+                Ok(data) => {
+                    let mime = match file_path.extension().and_then(|e| e.to_str()) {
+                        Some("json") => "application/json",
+                        Some("moc3") | Some("moc") => "application/octet-stream",
+                        Some("png") => "image/png",
+                        Some("jpg") | Some("jpeg") => "image/jpeg",
+                        Some("wav") => "audio/wav",
+                        Some("ogg") => "audio/ogg",
+                        Some("mp3") => "audio/mpeg",
+                        Some("mtn") => "text/plain",
+                        _ => "application/octet-stream",
+                    };
+                    tauri::http::Response::builder()
+                        .header("Content-Type", mime)
+                        .header("Access-Control-Allow-Origin", "*")
+                        .body(data)
+                        .unwrap()
+                }
+                Err(_) => tauri::http::Response::builder()
+                    .status(404)
+                    .body(b"Not found".to_vec())
+                    .unwrap(),
+            }
+        })
         .manage(Mutex::new(PetWindowState { initialized: false }))
         .invoke_handler(tauri::generate_handler![
             load_model,
             get_config,
             apply_model,
             add_model,
-            remove_model
+            remove_model,
+            set_setting
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -188,6 +227,12 @@ async fn apply_model(app: tauri::AppHandle, path: String) -> Result<(), String> 
     }
 
     Ok(())
+}
+
+#[tauri::command]
+fn set_setting(app: tauri::AppHandle, key: String, value: String) {
+    config::set_setting(&app, &key, &value);
+    app.emit("setting-changed", (&key, &value)).ok();
 }
 
 #[tauri::command]

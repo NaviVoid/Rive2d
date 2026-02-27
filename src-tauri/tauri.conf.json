@@ -25,11 +25,11 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost blob: data:; connect-src 'self' ipc: http://ipc.localhost asset: https://asset.localhost",
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost model: blob: data:; connect-src 'self' ipc: http://ipc.localhost asset: https://asset.localhost model:",
       "assetProtocol": {
         "enable": true,
         "scope": {
-          "allow": ["$HOME/**", "/tmp/**"]
+          "allow": ["$HOME/.local/share/com.rive2d.desktop-pet/**", "$HOME/**", "/tmp/**"]
         }
       }
     }

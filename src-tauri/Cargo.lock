@@ -2947,6 +2947,7 @@ dependencies = [
  "gtk",
  "gtk-layer-shell",
  "md5",
+ "percent-encoding",
  "rusqlite",
  "serde",
  "serde_json",
