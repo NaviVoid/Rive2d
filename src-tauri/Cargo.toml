@@ -25,3 +25,4 @@ percent-encoding = "2"
 gtk = "0.18"
 gdk = "0.18"
 gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
+webkit2gtk = { version = "2.0", features = ["v2_16"] }

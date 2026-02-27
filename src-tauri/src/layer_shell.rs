@@ -3,6 +3,7 @@ use gtk::prelude::*;
 use gtk_layer_shell::LayerShell;
 use std::sync::Mutex;
 use tauri::Manager;
+use webkit2gtk::{WebViewExt as WkWebViewExt, SettingsExt as WkSettingsExt};
 
 /// Holds a reference to the layer-shell GTK window so we can update its input region later.
 pub struct LayerShellWindow(Mutex<Option<gtk::ApplicationWindow>>);
@@ -107,6 +108,12 @@ fn create_layer_shell_window(
         glib::ControlFlow::Continue
     });
 
+    // Disable hardware acceleration on the WebView so WebKitGTK renders to
+    // the main GTK surface instead of a Wayland subsurface. This lets our
+    // queue_draw() tick callback correctly report full-surface damage and
+    // prevents transparent surface smearing when the Live2D model moves.
+    disable_hw_accel(&vbox);
+
     // Show the new window (this triggers realization with layer-shell active)
     new_gtk_window.show_all();
 
@@ -117,6 +124,28 @@ fn create_layer_shell_window(
     }
 
     Ok(new_gtk_window)
+}
+
+/// Find the WebKitWebView in the widget tree and disable hardware acceleration.
+/// This forces WebKitGTK to composite on the CPU into the main surface,
+/// so queue_draw() can report full-surface Wayland damage every frame.
+fn disable_hw_accel(container: &impl gtk::prelude::ContainerExt) {
+    for child in container.children() {
+        if let Ok(webview) = child.clone().downcast::<webkit2gtk::WebView>() {
+            if let Some(settings) = WkWebViewExt::settings(&webview) {
+                eprintln!("[rive2d] Disabling WebKitGTK hardware acceleration");
+                WkSettingsExt::set_hardware_acceleration_policy(
+                    &settings,
+                    webkit2gtk::HardwareAccelerationPolicy::Never,
+                );
+            }
+            return;
+        }
+        // Recurse into containers
+        if let Ok(c) = child.downcast::<gtk::Container>() {
+            disable_hw_accel(&c);
+        }
+    }
 }
 
 /// Update the GDK input region on the layer-shell window.

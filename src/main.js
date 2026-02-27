@@ -1,5 +1,5 @@
 import * as PIXI from 'pixi.js';
-import { Live2DModel } from 'untitled-pixi-live2d-engine';
+import { Live2DModel } from '@jannchie/pixi-live2d-display';
 
 // Expose PIXI globally for pixi-live2d-display
 window.PIXI = PIXI;
@@ -27,6 +27,7 @@ const ready = app.init({
   resizeTo: window,
   antialias: true,
   preference: 'webgl',   // WebKitGTK has no WebGPU
+  useBackBuffer: true,   // Force full-buffer blit to fix Wayland transparent surface smearing
 }).then(() => {
   app.stage.addChild(borderGfx);
 
