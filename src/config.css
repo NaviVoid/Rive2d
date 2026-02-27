@@ -1,0 +1,137 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #1e1e2e;
+  color: #cdd6f4;
+  padding: 24px;
+}
+
+.container {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  height: 100vh;
+  padding-bottom: 24px;
+}
+
+h1 {
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #a6adc8;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.model-path {
+  display: flex;
+  gap: 8px;
+}
+
+.model-path input {
+  flex: 1;
+  padding: 8px 12px;
+  background: #313244;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  color: #cdd6f4;
+  font-size: 13px;
+  outline: none;
+}
+
+.model-path input:focus {
+  border-color: #89b4fa;
+}
+
+button {
+  padding: 8px 16px;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  background: #45475a;
+  color: #cdd6f4;
+  transition: background 0.2s;
+}
+
+button:hover {
+  background: #585b70;
+}
+
+button.primary {
+  background: #89b4fa;
+  color: #1e1e2e;
+  font-weight: 600;
+}
+
+button.primary:hover {
+  background: #74c7ec;
+}
+
+button.primary:disabled {
+  background: #45475a;
+  color: #6c7086;
+  cursor: not-allowed;
+}
+
+.recent-list {
+  list-style: none;
+  max-height: 200px;
+  overflow-y: auto;
+  background: #313244;
+  border-radius: 6px;
+  border: 1px solid #45475a;
+}
+
+.recent-list:empty::after {
+  content: 'No recent models';
+  display: block;
+  padding: 12px;
+  color: #6c7086;
+  font-size: 13px;
+  text-align: center;
+}
+
+.recent-list li {
+  padding: 8px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  border-bottom: 1px solid #45475a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-list li:last-child {
+  border-bottom: none;
+}
+
+.recent-list li:hover {
+  background: #45475a;
+}
+
+.recent-list li.selected {
+  background: #45475a;
+  color: #89b4fa;
+}
+
+.actions {
+  margin-top: auto;
+  display: flex;
+  justify-content: flex-end;
+}

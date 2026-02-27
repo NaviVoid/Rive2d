@@ -7,8 +7,22 @@ pub fn setup_layer_shell(app: &tauri::App) -> Result<(), Box<dyn std::error::Err
     let main_window = app
         .get_webview_window("main")
         .ok_or("Failed to get main window")?;
+    setup_layer_shell_window(&main_window)
+}
 
-    // Hide the original Tauri-managed window (it's already realized/mapped)
+pub fn setup_layer_shell_from_handle(
+    app: &tauri::AppHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let main_window = app
+        .get_webview_window("main")
+        .ok_or("Failed to get main window")?;
+    setup_layer_shell_window(&main_window)
+}
+
+fn setup_layer_shell_window(
+    main_window: &tauri::WebviewWindow,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Hide the original Tauri-managed window
     main_window.hide()?;
 
     // Get the original GTK window and its application

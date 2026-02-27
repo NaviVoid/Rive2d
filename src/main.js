@@ -1,6 +1,5 @@
 import * as PIXI from 'pixi.js';
 import { Live2DModel } from 'pixi-live2d-display/cubism4';
-import { open } from '@tauri-apps/plugin-dialog';
 
 // Expose PIXI globally for pixi-live2d-display
 window.PIXI = PIXI;
@@ -54,29 +53,6 @@ async function loadModel(modelPath) {
     console.error('Failed to load model:', err);
   }
 }
-
-// File picker for loading custom models
-async function pickAndLoadModel() {
-  const { convertFileSrc } = window.__TAURI__.core;
-
-  const selected = await open({
-    multiple: false,
-    filters: [{
-      name: 'Live2D Model',
-      extensions: ['json']
-    }]
-  });
-
-  if (selected) {
-    const modelUrl = convertFileSrc(selected);
-    loadModel(modelUrl);
-  }
-}
-
-// Double-click canvas to open file picker
-document.getElementById('canvas').addEventListener('dblclick', () => {
-  pickAndLoadModel();
-});
 
 // Listen for model loading events from backend
 window.__TAURI__.event.listen('load-model', (event) => {
