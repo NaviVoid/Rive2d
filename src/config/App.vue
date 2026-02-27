@@ -6,6 +6,19 @@ import { open } from '@tauri-apps/plugin-dialog';
 const models = ref([]);
 const currentModel = ref(null);
 const showBorder = ref(false);
+const previews = ref({});
+
+async function loadPreviews(modelPaths) {
+  for (const path of modelPaths) {
+    if (previews.value[path]) continue;
+    try {
+      const texturePath = await invoke('get_model_preview', { path });
+      if (texturePath) {
+        previews.value[path] = 'model://localhost/' + texturePath;
+      }
+    } catch {}
+  }
+}
 
 async function refreshConfig() {
   try {
@@ -13,6 +26,7 @@ async function refreshConfig() {
     models.value = config.models;
     currentModel.value = config.current_model;
     showBorder.value = config.show_border;
+    loadPreviews(config.models);
   } catch (err) {
     console.error('Failed to load config:', err);
   }
@@ -42,6 +56,19 @@ async function removeModel(path) {
   await refreshConfig();
 }
 
+async function uploadPreview(modelPath) {
+  const selected = await open({
+    multiple: false,
+    filters: [
+      { name: 'Image', extensions: ['png', 'jpg', 'jpeg', 'webp'] },
+    ],
+  });
+  if (selected) {
+    await invoke('set_model_preview', { modelPath, imagePath: selected });
+    previews.value[modelPath] = 'model://localhost/' + selected;
+  }
+}
+
 async function toggleBorder() {
   showBorder.value = !showBorder.value;
   await invoke('set_setting', {
@@ -54,12 +81,6 @@ function fileName(path) {
   return path.split('/').pop();
 }
 
-function dirPath(path) {
-  const parts = path.split('/');
-  parts.pop();
-  return parts.join('/');
-}
-
 onMounted(refreshConfig);
 </script>
 
@@ -67,7 +88,7 @@ onMounted(refreshConfig);
   <div class="container">
     <header>
       <h1>Rive2d Settings</h1>
-      <button class="import-btn" @click="importModel">+ Import Model</button>
+      <button class="import-btn" @click="importModel">+ Import</button>
     </header>
 
     <section class="model-list" v-if="models.length > 0">
@@ -77,9 +98,12 @@ onMounted(refreshConfig);
         class="model-card"
         :class="{ active: model === currentModel }"
       >
+        <div class="model-preview" @click="uploadPreview(model)" title="Click to set preview image">
+          <img v-if="previews[model]" :src="previews[model]" alt="preview" />
+          <div v-else class="no-preview">+</div>
+        </div>
         <div class="model-info">
           <span class="model-name">{{ fileName(model) }}</span>
-          <span class="model-dir">{{ dirPath(model) }}</span>
         </div>
         <div class="model-actions">
           <span v-if="model === currentModel" class="badge">Active</span>
@@ -91,7 +115,7 @@ onMounted(refreshConfig);
 
     <section class="empty-state" v-else>
       <p>No models imported yet.</p>
-      <p class="hint">Click "Import Model" to add a Live2D model file.</p>
+      <p class="hint">Click "+ Import" to add a Live2D model.</p>
     </section>
 
     <footer>
@@ -166,12 +190,41 @@ button {
 .model-card {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 12px 16px;
+  padding: 14px 16px;
   background: #313244;
   border: 1px solid #45475a;
-  border-radius: 8px;
+  border-radius: 10px;
   transition: border-color 0.2s;
+  gap: 16px;
+}
+
+.model-preview {
+  width: 120px;
+  height: 120px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #1e1e2e;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.model-preview:hover {
+  opacity: 0.8;
+}
+
+.model-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.no-preview {
+  color: #585b70;
+  font-size: 32px;
 }
 
 .model-card.active {
@@ -187,16 +240,8 @@ button {
 }
 
 .model-name {
-  font-size: 14px;
+  font-size: 16px;
   font-weight: 500;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.model-dir {
-  font-size: 11px;
-  color: #6c7086;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -206,7 +251,7 @@ button {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-left: 12px;
+  margin-left: auto;
   flex-shrink: 0;
 }
 

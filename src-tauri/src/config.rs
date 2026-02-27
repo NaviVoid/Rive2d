@@ -131,6 +131,16 @@ pub fn remove_model(app: &tauri::AppHandle, path: &str) {
     }
 }
 
+pub fn get_setting(app: &tauri::AppHandle, key: &str) -> Option<String> {
+    let conn = open_db(app);
+    conn.query_row(
+        "SELECT value FROM config WHERE key = ?1",
+        [key],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
 pub fn set_setting(app: &tauri::AppHandle, key: &str, value: &str) {
     let conn = open_db(app);
     conn.execute(

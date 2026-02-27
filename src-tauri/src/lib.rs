@@ -59,6 +59,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_model,
             get_config,
+            get_model_preview,
+            set_model_preview,
             apply_model,
             add_model,
             remove_model,
@@ -132,7 +134,7 @@ pub fn create_config_window(app: &tauri::AppHandle) {
 
     let config_window = tauri::WebviewWindowBuilder::new(app, "config", url)
         .title("Rive2d Settings")
-        .inner_size(480.0, 400.0)
+        .inner_size(1024.0, 1024.0)
         .resizable(false)
         .build()
         .expect("Failed to create config window");
@@ -238,6 +240,54 @@ async fn apply_model(app: tauri::AppHandle, path: String) -> Result<(), String> 
 fn set_setting(app: tauri::AppHandle, key: String, value: String) {
     config::set_setting(&app, &key, &value);
     app.emit("setting-changed", (&key, &value)).ok();
+}
+
+/// Given a model JSON path, return the absolute path to a preview image.
+/// Checks for a user-uploaded preview first, then falls back to the model's first texture.
+#[tauri::command]
+fn get_model_preview(app: tauri::AppHandle, path: String) -> Option<String> {
+    // Check for custom preview in DB
+    let custom = config::get_setting(&app, &format!("preview:{}", path));
+    if let Some(ref p) = custom {
+        if std::path::Path::new(p).exists() {
+            return custom;
+        }
+    }
+
+    // Fall back to first texture from model JSON
+    let model_path = std::path::Path::new(&path);
+    let dir = model_path.parent()?;
+    let json_str = std::fs::read_to_string(model_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+
+    let texture = json
+        .get("textures")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            json.get("FileReferences")
+                .and_then(|fr| fr.get("Textures"))
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+        })?;
+
+    let abs = dir.join(texture);
+    if abs.exists() {
+        Some(abs.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
+#[tauri::command]
+fn set_model_preview(app: tauri::AppHandle, model_path: String, image_path: String) -> Result<(), String> {
+    if !std::path::Path::new(&image_path).exists() {
+        return Err("Image file not found".to_string());
+    }
+    config::set_setting(&app, &format!("preview:{}", model_path), &image_path);
+    Ok(())
 }
 
 #[tauri::command]
