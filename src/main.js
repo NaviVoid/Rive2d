@@ -94,6 +94,21 @@ listen('load-model', async (event) => {
   loadModel(modelUrl);
 });
 
+listen('reset-position', async () => {
+  await ready;
+  if (!currentModel) return;
+  // Get unscaled dimensions (width/height are affected by current scale)
+  const origW = currentModel.width / currentModel.scale.x;
+  const origH = currentModel.height / currentModel.scale.y;
+  const scaleX = app.screen.width / origW;
+  const scaleY = app.screen.height / origH;
+  currentModel.scale.set(Math.min(scaleX, scaleY) * 0.3);
+  currentModel.x = app.screen.width / 2;
+  currentModel.y = app.screen.height / 2;
+  updateBorder();
+  updateInputRegion();
+});
+
 listen('setting-changed', (event) => {
   const [key, value] = event.payload;
   if (key === 'show_border') {

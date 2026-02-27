@@ -140,6 +140,13 @@ pub fn set_setting(app: &tauri::AppHandle, key: &str, value: &str) {
     .ok();
 }
 
+pub fn delete_settings(app: &tauri::AppHandle, keys: &[&str]) {
+    let conn = open_db(app);
+    for key in keys {
+        conn.execute("DELETE FROM config WHERE key = ?1", [key]).ok();
+    }
+}
+
 pub fn set_model(app: &tauri::AppHandle, path: &str) {
     let conn = open_db(app);
     conn.execute(
