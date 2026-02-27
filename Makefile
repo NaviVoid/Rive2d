@@ -1,8 +1,10 @@
 .PHONY: dev build install check clean distclean fmt clippy
 
-# Run the app in development mode (Vite + Tauri)
+# Run the app in development mode (Vite + Tauri) with a dynamic port
 dev:
-	pnpm tauri dev
+	@PORT=$$(node -e "const s=require('net').createServer();s.listen(0,'127.0.0.1',()=>{process.stdout.write(String(s.address().port));s.close()})") && \
+	echo "[rive2d] dev port: $$PORT" && \
+	pnpm tauri dev --config '{"build":{"devUrl":"http://127.0.0.1:'$$PORT'","beforeDevCommand":"vite --port '$$PORT'"}}'
 
 # Build the release binary
 build:

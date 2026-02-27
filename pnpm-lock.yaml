@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@naari3/pixi-live2d-display':
-        specifier: ^1.2.5
-        version: 1.2.5(pixi.js@8.16.0)
       '@tauri-apps/api':
         specifier: ^2.0.0
         version: 2.10.1
@@ -23,6 +20,9 @@ importers:
       pixi.js:
         specifier: ^8.16.0
         version: 8.16.0
+      untitled-pixi-live2d-engine:
+        specifier: ^1.0.1
+        version: 1.0.1(@pixi/sound@6.0.1(pixi.js@8.16.0))(pixi.js@8.16.0)
       vue:
         specifier: ^3.5.29
         version: 3.5.29
@@ -194,13 +194,13 @@ packages:
   '@jridgewell/sourcemap-codec@1.5.5':
     resolution: {integrity: sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==}
 
-  '@naari3/pixi-live2d-display@1.2.5':
-    resolution: {integrity: sha512-pRHT74NtUmWCGwE+zabEe5zAeZ2MTYtgsRnQwDg5ompj351+zLvwNc9GnVSrcHKHM3OSExV971R2A3S5IdFN3Q==}
-    peerDependencies:
-      pixi.js: ^8.0.0
-
   '@pixi/colord@2.9.6':
     resolution: {integrity: sha512-nezytU2pw587fQstUu1AsJZDVEynjskwOL+kibwcdxsMBFqPsFFNA7xl0ii/gXuDi6M0xj3mfRJj8pBSc2jCfA==}
+
+  '@pixi/sound@6.0.1':
+    resolution: {integrity: sha512-hpFlQSScAR2L/CsEoIvDi7s1oGsu8y9Zd742Vd3982N+q3IF2vFuIfV9HN4ryjlGnhCT8yBlEgs1gp4G9Rt9TA==}
+    peerDependencies:
+      pixi.js: ^8.0.0
 
   '@rollup/rollup-android-arm-eabi@4.59.0':
     resolution: {integrity: sha512-upnNBkA6ZH2VKGcBj9Fyl9IGNPULcjXRlg0LLeaioQWueH30p6IXtJEbKAgvyv+mJaMxSm1l6xwDXYjpEMiLMg==}
@@ -522,6 +522,12 @@ packages:
     resolution: {integrity: sha512-w/Te7uMUVeH0CR8vZIjr+XiN41V+30lkDdK+NRIDCUYKKuL9VcmaUEmaPISuwGhLlrTGh5yu18lENtR9axSxYw==}
     engines: {node: '>=12'}
 
+  untitled-pixi-live2d-engine@1.0.1:
+    resolution: {integrity: sha512-feTQ5Rd2+eGiaov2EgDS+a6WVWmSDSUxkKKTAKuM9QF3d0topuqsqHWXO/8i9E+/4m9l8R9vOvF9JLGdayfp3g==}
+    peerDependencies:
+      '@pixi/sound': ^6.0.1
+      pixi.js: ^8.13.1
+
   vite@5.4.21:
     resolution: {integrity: sha512-o5a9xKjbtuhY6Bi5S3+HvbRERmouabWbyUcpXXUA1u+GNUKoROi9byOJ8M0nHbHYHkYICiMlqxkg1KkYmm25Sw==}
     engines: {node: ^18.0.0 || >=20.0.0}
@@ -647,11 +653,11 @@ snapshots:
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
 
-  '@naari3/pixi-live2d-display@1.2.5(pixi.js@8.16.0)':
+  '@pixi/colord@2.9.6': {}
+
+  '@pixi/sound@6.0.1(pixi.js@8.16.0)':
     dependencies:
       pixi.js: 8.16.0
-
-  '@pixi/colord@2.9.6': {}
 
   '@rollup/rollup-android-arm-eabi@4.59.0':
     optional: true
@@ -958,6 +964,11 @@ snapshots:
   source-map-js@1.2.1: {}
 
   tiny-lru@11.4.7: {}
+
+  untitled-pixi-live2d-engine@1.0.1(@pixi/sound@6.0.1(pixi.js@8.16.0))(pixi.js@8.16.0):
+    dependencies:
+      '@pixi/sound': 6.0.1(pixi.js@8.16.0)
+      pixi.js: 8.16.0
 
   vite@5.4.21:
     dependencies:

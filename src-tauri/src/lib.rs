@@ -21,6 +21,7 @@ pub fn run() {
     }
 
     let mut builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
         .plugin(tauri_plugin_dialog::init())
         .register_uri_scheme_protocol("model", |_ctx, request| {
             // Serve model files from the filesystem via model:// protocol
@@ -68,7 +69,8 @@ pub fn run() {
             add_model,
             remove_model,
             set_setting,
-            update_input_region
+            update_input_region,
+            js_log
         ]);
 
     // Manage the layer-shell window state (Linux only)
@@ -272,4 +274,9 @@ fn update_input_region(app: tauri::AppHandle, x: i32, y: i32, width: i32, height
     {
         let _ = (app, x, y, width, height);
     }
+}
+
+#[tauri::command]
+fn js_log(msg: String) {
+    eprintln!("[rive2d:js] {}", msg);
 }

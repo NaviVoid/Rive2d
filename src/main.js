@@ -1,5 +1,5 @@
 import * as PIXI from 'pixi.js';
-import { Live2DModel } from '@naari3/pixi-live2d-display';
+import { Live2DModel } from 'untitled-pixi-live2d-engine';
 
 // Expose PIXI globally for pixi-live2d-display
 window.PIXI = PIXI;
@@ -19,15 +19,15 @@ let dragOffset = { x: 0, y: 0 };
 // Border graphics overlay (drawn on top of model)
 const borderGfx = new PIXI.Graphics();
 
-async function init() {
-  await app.init({
-    canvas,
-    backgroundAlpha: 0,
-    backgroundColor: 0x000000,
-    resizeTo: window,
-    antialias: true,
-  });
-
+// init() is async; listeners registered before it so events aren't missed
+const ready = app.init({
+  canvas,
+  backgroundAlpha: 0,
+  backgroundColor: 0x000000,
+  resizeTo: window,
+  antialias: true,
+  preference: 'webgl',   // WebKitGTK has no WebGPU
+}).then(() => {
   app.stage.addChild(borderGfx);
 
   // Make stage interactive for drag move/up events
@@ -80,26 +80,27 @@ async function init() {
       updateInputRegion();
     }
   });
+});
 
-  // --- Event listeners ---
+// --- Register event listeners synchronously so we never miss backend events ---
 
-  invoke('get_config').then((config) => {
-    showBorder = config.show_border;
-  }).catch(() => {});
+invoke('get_config').then((config) => {
+  showBorder = config.show_border;
+}).catch(() => {});
 
-  listen('load-model', (event) => {
-    const modelUrl = 'model://localhost/' + event.payload;
-    loadModel(modelUrl);
-  });
+listen('load-model', async (event) => {
+  await ready;
+  const modelUrl = 'model://localhost/' + event.payload;
+  loadModel(modelUrl);
+});
 
-  listen('setting-changed', (event) => {
-    const [key, value] = event.payload;
-    if (key === 'show_border') {
-      showBorder = value === 'true';
-      updateBorder();
-    }
-  });
-}
+listen('setting-changed', (event) => {
+  const [key, value] = event.payload;
+  if (key === 'show_border') {
+    showBorder = value === 'true';
+    updateBorder();
+  }
+});
 
 // --- Input region helpers ---
 
@@ -220,11 +221,7 @@ async function loadModel(modelPath) {
 
     updateBorder();
     updateInputRegion();
-
-    console.log('[rive2d] Model loaded:', modelPath);
   } catch (err) {
     console.error('[rive2d] Failed to load model:', err);
   }
 }
-
-init();
