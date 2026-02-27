@@ -3,7 +3,7 @@ use gtk::prelude::*;
 use gtk_layer_shell::LayerShell;
 use std::sync::Mutex;
 use tauri::Manager;
-use webkit2gtk::{WebViewExt as WkWebViewExt, SettingsExt as WkSettingsExt};
+use webkit2gtk::WebViewExt as WkWebViewExt;
 
 /// Holds a reference to the layer-shell GTK window so we can update its input region later.
 pub struct LayerShellWindow(Mutex<Option<gtk::ApplicationWindow>>);
@@ -92,7 +92,7 @@ fn create_layer_shell_window(
     new_gtk_window.set_anchor(gtk_layer_shell::Edge::Left, true);
     new_gtk_window.set_anchor(gtk_layer_shell::Edge::Right, true);
 
-    // Paint transparent background
+    // Paint transparent background on the main GTK surface
     new_gtk_window.connect_draw(|_window, ctx| {
         ctx.set_source_rgba(0.0, 0.0, 0.0, 0.0);
         ctx.set_operator(gtk::cairo::Operator::Source);
@@ -100,50 +100,43 @@ fn create_layer_shell_window(
         glib::Propagation::Proceed
     });
 
-    // Force full-surface redraw every frame so moving content doesn't leave smear
-    // trails on the transparent Wayland surface (damage tracking only updates changed
-    // regions otherwise, leaving old pixels from the webview's previous frame).
+    // Keep the main surface cleared to transparent every frame
     new_gtk_window.add_tick_callback(|window, _clock| {
         window.queue_draw();
         glib::ControlFlow::Continue
     });
 
-    // Disable hardware acceleration on the WebView so WebKitGTK renders to
-    // the main GTK surface instead of a Wayland subsurface. This lets our
-    // queue_draw() tick callback correctly report full-surface damage and
-    // prevents transparent surface smearing when the Live2D model moves.
-    disable_hw_accel(&vbox);
-
     // Show the new window (this triggers realization with layer-shell active)
     new_gtk_window.show_all();
 
-    // Set empty input region so all clicks pass through initially
     if let Some(gdk_window) = new_gtk_window.window() {
         let empty_region = gtk::cairo::Region::create();
+        // Empty input region so all clicks pass through initially
         gdk_window.input_shape_combine_region(&empty_region, 0, 0);
+        // Empty opaque region tells the Wayland compositor that nothing is
+        // opaque, so it must always composite this surface (not skip regions).
+        gdk_window.set_opaque_region(Some(&empty_region));
     }
+
+    // Set WebView background to transparent AFTER the window is realized,
+    // so the WebProcess is ready to receive the setting.
+    set_webview_transparent(&vbox);
 
     Ok(new_gtk_window)
 }
 
-/// Find the WebKitWebView in the widget tree and disable hardware acceleration.
-/// This forces WebKitGTK to composite on the CPU into the main surface,
-/// so queue_draw() can report full-surface Wayland damage every frame.
-fn disable_hw_accel(container: &impl gtk::prelude::ContainerExt) {
+/// Find the WebKitWebView and set its background to transparent.
+/// Hardware acceleration stays ON so WebGL renders to its own Wayland subsurface,
+/// bypassing the main surface's damage tracking issues entirely.
+fn set_webview_transparent(container: &impl gtk::prelude::ContainerExt) {
     for child in container.children() {
         if let Ok(webview) = child.clone().downcast::<webkit2gtk::WebView>() {
-            if let Some(settings) = WkWebViewExt::settings(&webview) {
-                eprintln!("[rive2d] Disabling WebKitGTK hardware acceleration");
-                WkSettingsExt::set_hardware_acceleration_policy(
-                    &settings,
-                    webkit2gtk::HardwareAccelerationPolicy::Never,
-                );
-            }
+            eprintln!("[rive2d] Setting WebView background to transparent");
+            WkWebViewExt::set_background_color(&webview, &gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
             return;
         }
-        // Recurse into containers
         if let Ok(c) = child.downcast::<gtk::Container>() {
-            disable_hw_accel(&c);
+            set_webview_transparent(&c);
         }
     }
 }
