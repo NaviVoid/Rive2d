@@ -7,6 +7,34 @@ window.PIXI = PIXI;
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+// Disable PixiJS Worker texture loading — Workers have their own fetch() that
+// can't access Tauri's model:// custom protocol.  Keep createImageBitmap enabled
+// so PixiJS uses the main-thread fetch→blob→createImageBitmap path.
+PIXI.loadTextures.config.preferWorkers = false;
+
+// Override fetch() so model:// URLs are loaded via XHR (which WebKitGTK routes
+// through Tauri's custom protocol handler).  Returns a proper Response object
+// so PixiJS's loadImageBitmap pipeline works unchanged.
+const _origFetch = window.fetch;
+window.fetch = function (input, init) {
+  const url = typeof input === 'string' ? input : input?.url;
+  if (url && url.startsWith('model://')) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.responseType = 'arraybuffer';
+      xhr.onload = () => {
+        const ct = xhr.getResponseHeader('Content-Type') || 'application/octet-stream';
+        const blob = new Blob([xhr.response], { type: ct });
+        resolve(new Response(blob, { status: 200, statusText: 'OK' }));
+      };
+      xhr.onerror = () => reject(new TypeError('Network request failed'));
+      xhr.send();
+    });
+  }
+  return _origFetch.apply(this, arguments);
+};
+
 const canvas = document.getElementById('canvas');
 
 const app = new PIXI.Application();

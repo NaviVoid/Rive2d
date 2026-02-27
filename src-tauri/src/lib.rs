@@ -31,7 +31,7 @@ pub fn run() {
 
             let file_path = std::path::Path::new(&path);
             match std::fs::read(file_path) {
-                Ok(data) => {
+                Ok(mut data) => {
                     let mime = match file_path.extension().and_then(|e| e.to_str()) {
                         Some("json") => "application/json",
                         Some("moc3") | Some("moc") => "application/octet-stream",
@@ -43,9 +43,27 @@ pub fn run() {
                         Some("mtn") => "text/plain",
                         _ => "application/octet-stream",
                     };
+
+                    // Patch model3.json: add missing "Groups" field required by Cubism SDK
+                    if path.ends_with(".model3.json") {
+                        if let Ok(text) = std::str::from_utf8(&data) {
+                            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text) {
+                                if json.get("FileReferences").is_some() && json.get("Groups").is_none() {
+                                    json["Groups"] = serde_json::json!([]);
+                                    if let Ok(patched) = serde_json::to_vec(&json) {
+                                        data = patched;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     tauri::http::Response::builder()
                         .header("Content-Type", mime)
                         .header("Access-Control-Allow-Origin", "*")
+                        .header("Access-Control-Allow-Methods", "GET, OPTIONS")
+                        .header("Access-Control-Allow-Headers", "*")
+                        .header("Cross-Origin-Resource-Policy", "cross-origin")
                         .body(data)
                         .unwrap()
                 }

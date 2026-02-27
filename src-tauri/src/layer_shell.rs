@@ -3,7 +3,7 @@ use gtk::prelude::*;
 use gtk_layer_shell::LayerShell;
 use std::sync::Mutex;
 use tauri::Manager;
-use webkit2gtk::WebViewExt as WkWebViewExt;
+use webkit2gtk::{SecurityManagerExt, WebContextExt, WebViewExt as WkWebViewExt};
 
 /// Holds a reference to the layer-shell GTK window so we can update its input region later.
 pub struct LayerShellWindow(Mutex<Option<gtk::ApplicationWindow>>);
@@ -133,6 +133,15 @@ fn set_webview_transparent(container: &impl gtk::prelude::ContainerExt) {
         if let Ok(webview) = child.clone().downcast::<webkit2gtk::WebView>() {
             eprintln!("[rive2d] Setting WebView background to transparent");
             WkWebViewExt::set_background_color(&webview, &gdk::RGBA::new(0.0, 0.0, 0.0, 0.0));
+
+            // Register model:// as CORS-enabled so WebGL can use textures from it
+            if let Some(ctx) = webview.web_context() {
+                if let Some(sm) = ctx.security_manager() {
+                    sm.register_uri_scheme_as_cors_enabled("model");
+                    eprintln!("[rive2d] Registered model:// as CORS-enabled");
+                }
+            }
+
             return;
         }
         if let Ok(c) = child.downcast::<gtk::Container>() {
