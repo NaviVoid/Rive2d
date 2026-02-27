@@ -99,6 +99,14 @@ fn create_layer_shell_window(
         glib::Propagation::Proceed
     });
 
+    // Force full-surface redraw every frame so moving content doesn't leave smear
+    // trails on the transparent Wayland surface (damage tracking only updates changed
+    // regions otherwise, leaving old pixels from the webview's previous frame).
+    new_gtk_window.add_tick_callback(|window, _clock| {
+        window.queue_draw();
+        glib::ControlFlow::Continue
+    });
+
     // Show the new window (this triggers realization with layer-shell active)
     new_gtk_window.show_all();
 

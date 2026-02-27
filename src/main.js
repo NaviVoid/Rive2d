@@ -1,5 +1,5 @@
 import * as PIXI from 'pixi.js';
-import { Live2DModel } from 'pixi-live2d-display';
+import { Live2DModel } from '@naari3/pixi-live2d-display';
 
 // Expose PIXI globally for pixi-live2d-display
 window.PIXI = PIXI;
@@ -9,13 +9,7 @@ const { listen } = window.__TAURI__.event;
 
 const canvas = document.getElementById('canvas');
 
-const app = new PIXI.Application({
-  view: canvas,
-  backgroundAlpha: 0,
-  backgroundColor: 0x000000,
-  resizeTo: window,
-  antialias: true,
-});
+const app = new PIXI.Application();
 
 let currentModel = null;
 let showBorder = false;
@@ -24,11 +18,88 @@ let dragOffset = { x: 0, y: 0 };
 
 // Border graphics overlay (drawn on top of model)
 const borderGfx = new PIXI.Graphics();
-app.stage.addChild(borderGfx);
 
-// Make stage interactive for drag move/up events
-app.stage.eventMode = 'static';
-app.stage.hitArea = new PIXI.Rectangle(0, 0, app.screen.width, app.screen.height);
+async function init() {
+  await app.init({
+    canvas,
+    backgroundAlpha: 0,
+    backgroundColor: 0x000000,
+    resizeTo: window,
+    antialias: true,
+  });
+
+  app.stage.addChild(borderGfx);
+
+  // Make stage interactive for drag move/up events
+  app.stage.eventMode = 'static';
+  app.stage.hitArea = new PIXI.Rectangle(0, 0, app.screen.width, app.screen.height);
+
+  // --- Drag: move & end (on stage to capture events outside model) ---
+
+  app.stage.on('pointermove', (e) => {
+    if (!dragging || !currentModel) return;
+    currentModel.x = e.global.x - dragOffset.x;
+    currentModel.y = e.global.y - dragOffset.y;
+    updateBorder();
+  });
+
+  app.stage.on('pointerup', () => {
+    if (dragging && currentModel) {
+      dragging = false;
+      savePosition();
+      updateInputRegion();
+    }
+  });
+
+  app.stage.on('pointerupoutside', () => {
+    if (dragging && currentModel) {
+      dragging = false;
+      savePosition();
+      updateInputRegion();
+    }
+  });
+
+  // --- Scroll wheel resize ---
+
+  app.canvas.addEventListener('wheel', (e) => {
+    if (!currentModel) return;
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 0.95 : 1.05;
+    const newScale = Math.max(0.05, Math.min(2.0, currentModel.scale.x * factor));
+    currentModel.scale.set(newScale);
+    updateBorder();
+    updateInputRegion();
+    debouncedSaveScale(newScale);
+  }, { passive: false });
+
+  // --- Window resize: update stage hit area ---
+
+  window.addEventListener('resize', () => {
+    app.stage.hitArea = new PIXI.Rectangle(0, 0, app.screen.width, app.screen.height);
+    if (currentModel) {
+      updateInputRegion();
+    }
+  });
+
+  // --- Event listeners ---
+
+  invoke('get_config').then((config) => {
+    showBorder = config.show_border;
+  }).catch(() => {});
+
+  listen('load-model', (event) => {
+    const modelUrl = 'model://localhost/' + event.payload;
+    loadModel(modelUrl);
+  });
+
+  listen('setting-changed', (event) => {
+    const [key, value] = event.payload;
+    if (key === 'show_border') {
+      showBorder = value === 'true';
+      updateBorder();
+    }
+  });
+}
 
 // --- Input region helpers ---
 
@@ -59,8 +130,8 @@ function updateBorder() {
   borderGfx.clear();
   if (!currentModel || !showBorder) return;
   const bounds = currentModel.getBounds();
-  borderGfx.lineStyle(2, 0xff0000, 1);
-  borderGfx.drawRect(bounds.x, bounds.y, bounds.width, bounds.height);
+  borderGfx.rect(bounds.x, bounds.y, bounds.width, bounds.height);
+  borderGfx.stroke({ width: 2, color: 0xff0000, alpha: 1 });
 }
 
 // --- Save helpers ---
@@ -156,71 +227,4 @@ async function loadModel(modelPath) {
   }
 }
 
-// --- Drag: move & end (on stage to capture events outside model) ---
-
-app.stage.on('pointermove', (e) => {
-  if (!dragging || !currentModel) return;
-  currentModel.x = e.global.x - dragOffset.x;
-  currentModel.y = e.global.y - dragOffset.y;
-  updateBorder();
-});
-
-app.stage.on('pointerup', () => {
-  if (dragging && currentModel) {
-    dragging = false;
-    savePosition();
-    updateInputRegion();
-  }
-});
-
-app.stage.on('pointerupoutside', () => {
-  if (dragging && currentModel) {
-    dragging = false;
-    savePosition();
-    updateInputRegion();
-  }
-});
-
-// --- Scroll wheel resize ---
-
-canvas.addEventListener('wheel', (e) => {
-  if (!currentModel) return;
-  e.preventDefault();
-  const factor = e.deltaY > 0 ? 0.95 : 1.05;
-  const newScale = Math.max(0.05, Math.min(2.0, currentModel.scale.x * factor));
-  currentModel.scale.set(newScale);
-  updateBorder();
-  updateInputRegion();
-  debouncedSaveScale(newScale);
-}, { passive: false });
-
-// --- Window resize: update stage hit area ---
-
-window.addEventListener('resize', () => {
-  app.stage.hitArea = new PIXI.Rectangle(0, 0, app.screen.width, app.screen.height);
-  if (currentModel) {
-    updateInputRegion();
-  }
-});
-
-// --- Event listeners ---
-
-// Load initial config for border setting
-invoke('get_config').then((config) => {
-  showBorder = config.show_border;
-}).catch(() => {});
-
-// Listen for model loading events from backend
-listen('load-model', (event) => {
-  const modelUrl = 'model://localhost/' + event.payload;
-  loadModel(modelUrl);
-});
-
-// Listen for setting changes from config window
-listen('setting-changed', (event) => {
-  const [key, value] = event.payload;
-  if (key === 'show_border') {
-    showBorder = value === 'true';
-    updateBorder();
-  }
-});
+init();
