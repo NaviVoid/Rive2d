@@ -1,13 +1,39 @@
 use gtk::glib;
 use gtk::prelude::*;
 use gtk_layer_shell::LayerShell;
+use std::sync::Mutex;
 use tauri::Manager;
+
+/// Holds a reference to the layer-shell GTK window so we can update its input region later.
+pub struct LayerShellWindow(Mutex<Option<gtk::ApplicationWindow>>);
+
+// SAFETY: gtk::ApplicationWindow is reference-counted (GObject). We only access it
+// on the GTK main thread via glib::idle_add_once. The Mutex ensures exclusive access.
+unsafe impl Send for LayerShellWindow {}
+unsafe impl Sync for LayerShellWindow {}
+
+impl LayerShellWindow {
+    pub fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    pub fn set(&self, window: gtk::ApplicationWindow) {
+        *self.0.lock().unwrap() = Some(window);
+    }
+
+    pub fn get(&self) -> Option<gtk::ApplicationWindow> {
+        self.0.lock().unwrap().clone()
+    }
+}
 
 pub fn setup_layer_shell(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let main_window = app
         .get_webview_window("main")
         .ok_or("Failed to get main window")?;
-    setup_layer_shell_window(&main_window)
+    let gtk_window = create_layer_shell_window(&main_window)?;
+    let state = app.state::<LayerShellWindow>();
+    state.set(gtk_window);
+    Ok(())
 }
 
 pub fn setup_layer_shell_from_handle(
@@ -16,12 +42,15 @@ pub fn setup_layer_shell_from_handle(
     let main_window = app
         .get_webview_window("main")
         .ok_or("Failed to get main window")?;
-    setup_layer_shell_window(&main_window)
+    let gtk_window = create_layer_shell_window(&main_window)?;
+    let state = app.state::<LayerShellWindow>();
+    state.set(gtk_window);
+    Ok(())
 }
 
-fn setup_layer_shell_window(
+fn create_layer_shell_window(
     main_window: &tauri::WebviewWindow,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<gtk::ApplicationWindow, Box<dyn std::error::Error>> {
     // Hide the original Tauri-managed window
     main_window.hide()?;
 
@@ -56,9 +85,11 @@ fn setup_layer_shell_window(
     new_gtk_window.set_keyboard_mode(gtk_layer_shell::KeyboardMode::None);
     new_gtk_window.set_namespace("rive2d-desktop-pet");
 
-    // Set window size
-    new_gtk_window.set_width_request(512);
-    new_gtk_window.set_height_request(512);
+    // Anchor all 4 edges so the compositor fills the entire screen
+    new_gtk_window.set_anchor(gtk_layer_shell::Edge::Top, true);
+    new_gtk_window.set_anchor(gtk_layer_shell::Edge::Bottom, true);
+    new_gtk_window.set_anchor(gtk_layer_shell::Edge::Left, true);
+    new_gtk_window.set_anchor(gtk_layer_shell::Edge::Right, true);
 
     // Paint transparent background
     new_gtk_window.connect_draw(|_window, ctx| {
@@ -71,5 +102,31 @@ fn setup_layer_shell_window(
     // Show the new window (this triggers realization with layer-shell active)
     new_gtk_window.show_all();
 
-    Ok(())
+    // Set empty input region so all clicks pass through initially
+    if let Some(gdk_window) = new_gtk_window.window() {
+        let empty_region = gtk::cairo::Region::create();
+        gdk_window.input_shape_combine_region(&empty_region, 0, 0);
+    }
+
+    Ok(new_gtk_window)
+}
+
+/// Update the GDK input region on the layer-shell window.
+/// width/height <= 0 means "pass through everything" (empty region).
+pub fn update_input_region(
+    window: &gtk::ApplicationWindow,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) {
+    if let Some(gdk_window) = window.window() {
+        let region = if width > 0 && height > 0 {
+            let rect = gtk::cairo::RectangleInt::new(x, y, width, height);
+            gtk::cairo::Region::create_rectangle(&rect)
+        } else {
+            gtk::cairo::Region::create()
+        };
+        gdk_window.input_shape_combine_region(&region, 0, 0);
+    }
 }

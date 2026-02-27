@@ -20,7 +20,7 @@ pub fn run() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .register_uri_scheme_protocol("model", |_ctx, request| {
             // Serve model files from the filesystem via model:// protocol
@@ -67,8 +67,17 @@ pub fn run() {
             apply_model,
             add_model,
             remove_model,
-            set_setting
-        ])
+            set_setting,
+            update_input_region
+        ]);
+
+    // Manage the layer-shell window state (Linux only)
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.manage(layer_shell::LayerShellWindow::new());
+    }
+
+    builder
         .setup(|app| {
             let handle = app.handle().clone();
             tray::setup_tray(&handle)?;
@@ -244,5 +253,23 @@ fn load_model(path: String) -> Result<String, String> {
     match path.extension().and_then(|e| e.to_str()) {
         Some("json") => std::fs::read_to_string(path).map_err(|e| e.to_string()),
         _ => Err("Invalid model file format".to_string()),
+    }
+}
+
+#[tauri::command]
+fn update_input_region(app: tauri::AppHandle, x: i32, y: i32, width: i32, height: i32) {
+    #[cfg(target_os = "linux")]
+    {
+        let handle = app.clone();
+        gtk::glib::idle_add_once(move || {
+            let state = handle.state::<layer_shell::LayerShellWindow>();
+            if let Some(window) = state.get() {
+                layer_shell::update_input_region(&window, x, y, width, height);
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (app, x, y, width, height);
     }
 }

@@ -15,8 +15,8 @@
       {
         "label": "main",
         "title": "Rive2d",
-        "width": 512,
-        "height": 512,
+        "width": 1920,
+        "height": 1080,
         "resizable": false,
         "decorations": false,
         "transparent": true,

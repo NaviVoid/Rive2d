@@ -4,23 +4,10 @@ import { Live2DModel } from 'pixi-live2d-display';
 // Expose PIXI globally for pixi-live2d-display
 window.PIXI = PIXI;
 
+const { invoke } = window.__TAURI__.core;
+const { listen } = window.__TAURI__.event;
+
 const canvas = document.getElementById('canvas');
-
-// Debug overlay for showing errors visually
-const debugEl = document.createElement('div');
-debugEl.style.cssText =
-  'position:fixed;top:0;left:0;right:0;color:#0f0;background:rgba(0,0,0,0.7);' +
-  'font:11px monospace;padding:4px 8px;white-space:pre-wrap;pointer-events:none;z-index:9999;max-height:50%;overflow:auto;';
-document.body.appendChild(debugEl);
-
-function debugLog(msg) {
-  console.log('[rive2d]', msg);
-  debugEl.textContent += msg + '\n';
-}
-
-// Check SDK availability
-debugLog('Live2D (Cubism2): ' + (typeof window.Live2D !== 'undefined' ? 'OK' : 'MISSING'));
-debugLog('Live2DCubismCore (Cubism4): ' + (typeof window.Live2DCubismCore !== 'undefined' ? 'OK' : 'MISSING'));
 
 const app = new PIXI.Application({
   view: canvas,
@@ -31,19 +18,70 @@ const app = new PIXI.Application({
 });
 
 let currentModel = null;
+let showBorder = false;
+let dragging = false;
+let dragOffset = { x: 0, y: 0 };
 
-function applyBorder(show) {
-  if (show) {
-    canvas.style.border = '2px solid red';
-    canvas.style.boxSizing = 'border-box';
-  } else {
-    canvas.style.border = 'none';
-  }
+// Border graphics overlay (drawn on top of model)
+const borderGfx = new PIXI.Graphics();
+app.stage.addChild(borderGfx);
+
+// Make stage interactive for drag move/up events
+app.stage.eventMode = 'static';
+app.stage.hitArea = new PIXI.Rectangle(0, 0, app.screen.width, app.screen.height);
+
+// --- Input region helpers ---
+
+function updateInputRegion() {
+  if (!currentModel) return;
+  const bounds = currentModel.getBounds();
+  const pad = 20;
+  invoke('update_input_region', {
+    x: Math.max(0, Math.floor(bounds.x - pad)),
+    y: Math.max(0, Math.floor(bounds.y - pad)),
+    width: Math.ceil(bounds.width + pad * 2),
+    height: Math.ceil(bounds.height + pad * 2),
+  }).catch(() => {});
 }
 
-async function loadModel(modelPath) {
-  debugLog('loadModel: ' + modelPath);
+function setFullInputRegion() {
+  invoke('update_input_region', {
+    x: 0,
+    y: 0,
+    width: window.innerWidth,
+    height: window.innerHeight,
+  }).catch(() => {});
+}
 
+// --- Border drawing ---
+
+function updateBorder() {
+  borderGfx.clear();
+  if (!currentModel || !showBorder) return;
+  const bounds = currentModel.getBounds();
+  borderGfx.lineStyle(2, 0xff0000, 1);
+  borderGfx.drawRect(bounds.x, bounds.y, bounds.width, bounds.height);
+}
+
+// --- Save helpers ---
+
+let scaleSaveTimeout = null;
+function debouncedSaveScale(scale) {
+  clearTimeout(scaleSaveTimeout);
+  scaleSaveTimeout = setTimeout(() => {
+    invoke('set_setting', { key: 'model_scale', value: String(scale) });
+  }, 300);
+}
+
+function savePosition() {
+  if (!currentModel) return;
+  invoke('set_setting', { key: 'model_x', value: String(currentModel.x) });
+  invoke('set_setting', { key: 'model_y', value: String(currentModel.y) });
+}
+
+// --- Model loading ---
+
+async function loadModel(modelPath) {
   if (currentModel) {
     app.stage.removeChild(currentModel);
     currentModel.destroy();
@@ -52,22 +90,45 @@ async function loadModel(modelPath) {
 
   try {
     const model = await Live2DModel.from(modelPath, {
-      autoInteract: true,
+      autoHitTest: true,
+      autoFocus: true,
     });
-    debugLog('Model created: ' + model.width + 'x' + model.height);
 
-    const scaleX = app.screen.width / model.width;
-    const scaleY = app.screen.height / model.height;
-    const scale = Math.min(scaleX, scaleY) * 0.8;
-    model.scale.set(scale);
+    // Load saved position/scale from config
+    const config = await invoke('get_config');
+
+    if (config.model_scale != null) {
+      model.scale.set(config.model_scale);
+    } else {
+      // Default: fit model to ~30% of screen
+      const scaleX = app.screen.width / model.width;
+      const scaleY = app.screen.height / model.height;
+      model.scale.set(Math.min(scaleX, scaleY) * 0.3);
+    }
 
     model.anchor.set(0.5, 0.5);
-    model.x = app.screen.width / 2;
-    model.y = app.screen.height / 2;
 
-    app.stage.addChild(model);
-    currentModel = model;
+    if (config.model_x != null && config.model_y != null) {
+      model.x = config.model_x;
+      model.y = config.model_y;
+    } else {
+      model.x = app.screen.width / 2;
+      model.y = app.screen.height / 2;
+    }
 
+    // Enable interaction for drag
+    model.eventMode = 'static';
+    model.cursor = 'pointer';
+
+    // Drag start
+    model.on('pointerdown', (e) => {
+      dragging = true;
+      dragOffset.x = e.global.x - model.x;
+      dragOffset.y = e.global.y - model.y;
+      setFullInputRegion();
+    });
+
+    // Hit areas for animations
     model.on('hit', (hitAreaNames) => {
       if (hitAreaNames.includes('Body') || hitAreaNames.includes('body')) {
         model.motion('tap_body');
@@ -77,39 +138,89 @@ async function loadModel(modelPath) {
       }
     });
 
-    debugLog('Model loaded OK');
+    app.stage.addChild(model);
+
+    // Keep border graphics on top
+    app.stage.removeChild(borderGfx);
+    app.stage.addChild(borderGfx);
+
+    currentModel = model;
+    showBorder = config.show_border;
+
+    updateBorder();
+    updateInputRegion();
+
+    console.log('[rive2d] Model loaded:', modelPath);
   } catch (err) {
-    debugLog('ERROR: ' + err.message);
-    debugLog(err.stack || '');
+    console.error('[rive2d] Failed to load model:', err);
   }
 }
 
+// --- Drag: move & end (on stage to capture events outside model) ---
+
+app.stage.on('pointermove', (e) => {
+  if (!dragging || !currentModel) return;
+  currentModel.x = e.global.x - dragOffset.x;
+  currentModel.y = e.global.y - dragOffset.y;
+  updateBorder();
+});
+
+app.stage.on('pointerup', () => {
+  if (dragging && currentModel) {
+    dragging = false;
+    savePosition();
+    updateInputRegion();
+  }
+});
+
+app.stage.on('pointerupoutside', () => {
+  if (dragging && currentModel) {
+    dragging = false;
+    savePosition();
+    updateInputRegion();
+  }
+});
+
+// --- Scroll wheel resize ---
+
+canvas.addEventListener('wheel', (e) => {
+  if (!currentModel) return;
+  e.preventDefault();
+  const factor = e.deltaY > 0 ? 0.95 : 1.05;
+  const newScale = Math.max(0.05, Math.min(2.0, currentModel.scale.x * factor));
+  currentModel.scale.set(newScale);
+  updateBorder();
+  updateInputRegion();
+  debouncedSaveScale(newScale);
+}, { passive: false });
+
+// --- Window resize: update stage hit area ---
+
+window.addEventListener('resize', () => {
+  app.stage.hitArea = new PIXI.Rectangle(0, 0, app.screen.width, app.screen.height);
+  if (currentModel) {
+    updateInputRegion();
+  }
+});
+
+// --- Event listeners ---
+
 // Load initial config for border setting
-window.__TAURI__.core.invoke('get_config').then((config) => {
-  applyBorder(config.show_border);
+invoke('get_config').then((config) => {
+  showBorder = config.show_border;
 }).catch(() => {});
 
 // Listen for model loading events from backend
-window.__TAURI__.event.listen('load-model', (event) => {
-  debugLog('Event payload: ' + event.payload);
-  // Use custom model:// protocol to bypass asset protocol scope issues
+listen('load-model', (event) => {
   const modelUrl = 'model://localhost/' + event.payload;
-  debugLog('Model URL: ' + modelUrl);
   loadModel(modelUrl);
 });
 
 // Listen for setting changes from config window
-window.__TAURI__.event.listen('setting-changed', (event) => {
+listen('setting-changed', (event) => {
   const [key, value] = event.payload;
   if (key === 'show_border') {
-    applyBorder(value === 'true');
-  }
-});
-
-// Handle window resize
-window.addEventListener('resize', () => {
-  if (currentModel) {
-    currentModel.x = app.screen.width / 2;
-    currentModel.y = app.screen.height / 2;
+    showBorder = value === 'true';
+    updateBorder();
   }
 });

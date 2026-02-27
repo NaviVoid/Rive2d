@@ -8,6 +8,9 @@ pub struct AppConfig {
     pub current_model: Option<String>,
     pub models: Vec<String>,
     pub show_border: bool,
+    pub model_x: Option<f64>,
+    pub model_y: Option<f64>,
+    pub model_scale: Option<f64>,
 }
 
 fn db_path(app: &tauri::AppHandle) -> PathBuf {
@@ -66,10 +69,40 @@ pub fn load(app: &tauri::AppHandle) -> AppConfig {
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    let model_x: Option<f64> = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'model_x'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse().ok());
+
+    let model_y: Option<f64> = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'model_y'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse().ok());
+
+    let model_scale: Option<f64> = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'model_scale'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse().ok());
+
     AppConfig {
         current_model,
         models,
         show_border,
+        model_x,
+        model_y,
+        model_scale,
     }
 }
 
