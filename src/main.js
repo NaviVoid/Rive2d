@@ -72,6 +72,9 @@ const DRAG_THRESHOLD = 4; // px — ignore micro-movements for tap detection
 // Graphics overlays (drawn on top of model)
 const borderGfx = new PIXI.Graphics();
 const hitAreaGfx = new PIXI.Graphics();
+const hitAreaContainer = new PIXI.Container();
+hitAreaContainer.addChild(hitAreaGfx);
+const hitAreaLabels = []; // pool of PIXI.Text for hit area names
 
 // init() is async; listeners registered before it so events aren't missed
 const ready = app.init({
@@ -82,7 +85,7 @@ const ready = app.init({
   antialias: true,
   preference: 'webgl',   // WebKitGTK has no WebGPU
 }).then(() => {
-  app.stage.addChild(hitAreaGfx);
+  app.stage.addChild(hitAreaContainer);
   app.stage.addChild(borderGfx);
 
   // Make stage interactive for drag move/up events
@@ -253,6 +256,9 @@ const hitAreaBounds = { x: 0, y: 0, width: 0, height: 0 };
 
 function drawHitAreas() {
   hitAreaGfx.clear();
+  // Hide all labels first
+  for (const label of hitAreaLabels) label.visible = false;
+
   if (!currentModel || !showHitAreas) return;
 
   const internalModel = currentModel.internalModel;
@@ -260,6 +266,7 @@ function drawHitAreas() {
   const transform = internalModel.localTransform;
   const wt = currentModel.worldTransform;
 
+  let labelIdx = 0;
   for (const name of Object.keys(hitAreas)) {
     const hitArea = hitAreas[name];
     let drawIndex = hitArea.index;
@@ -283,6 +290,23 @@ function drawHitAreas() {
 
     hitAreaGfx.rect(sx, sy, sw, sh);
     hitAreaGfx.stroke({ width: 2, color: 0xe3a2ff, alpha: 0.8 });
+
+    // Show name label at top-left of the hit area rect
+    if (labelIdx >= hitAreaLabels.length) {
+      const label = new PIXI.Text({ text: '', style: {
+        fontSize: 12,
+        fill: 0xe3a2ff,
+        fontFamily: 'system-ui, sans-serif',
+      }});
+      hitAreaLabels.push(label);
+      hitAreaContainer.addChild(label);
+    }
+    const label = hitAreaLabels[labelIdx];
+    label.text = name;
+    label.x = sx + 3;
+    label.y = sy + 2;
+    label.visible = true;
+    labelIdx++;
   }
 }
 
@@ -394,6 +418,7 @@ async function loadModel(modelPath) {
   if (currentModel) {
     app.ticker.remove(drawHitAreas);
     hitAreaGfx.clear();
+    for (const label of hitAreaLabels) label.visible = false;
     app.stage.removeChild(currentModel);
     // Evict textures from PixiJS asset cache before destroying, otherwise
     // Assets.load() returns stale destroyed textures for the same URLs.
@@ -510,8 +535,8 @@ async function loadModel(modelPath) {
     app.stage.addChild(model);
 
     // Keep overlays on top
-    app.stage.removeChild(hitAreaGfx);
-    app.stage.addChild(hitAreaGfx);
+    app.stage.removeChild(hitAreaContainer);
+    app.stage.addChild(hitAreaContainer);
     app.stage.removeChild(borderGfx);
     app.stage.addChild(borderGfx);
 
