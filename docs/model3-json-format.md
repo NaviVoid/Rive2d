@@ -279,19 +279,33 @@ Drag-to-parameter mapping: dragging on a hit area changes a Live2D parameter val
 
 | Field         | Type   | Description                                                                                         |
 | ------------- | ------ | --------------------------------------------------------------------------------------------------- |
-| `Id`          | string | Live2D parameter ID to control. May not exist in the .moc3 — still functional for MaxMtn triggering |
+| `Id`          | string | Live2D parameter ID to control. May not exist in the .moc3 — see **Virtual Parameters** below       |
 | `HitArea`     | string | Hit area Name that activates this drag                                                              |
-| `Axis`        | int    | `0` = horizontal (X), `1` = vertical (Y)                                                            |
-| `Factor`      | float  | Pixels-to-parameter sensitivity. Negative inverts direction                                         |
+| `Axis`        | int    | `0` = horizontal (X: right=increase, left=decrease), `1` = vertical (Y: down=increase, up=decrease) |
+| `Factor`      | float  | Parameter value change per pixel. Effective change = `Factor × modelScale`. Negative inverts direction |
 | `ReleaseType` | int    | `0` = spring back to default, `1` = spring back (timed), `2` = stay at value, `3` = sticky/persistent |
 | `Release`     | int    | Spring-back animation duration in ms                                                                |
 | `LockParam`   | bool   | Lock the parameter (prevent other controllers from changing it) during drag                         |
 | `MaxMtn`      | string | Motion triggered when parameter reaches its maximum value                                           |
 | `MinMtn`      | string | Motion triggered when parameter reaches its minimum value (legacy format)                           |
 | `EndMtn`      | string | Motion triggered when drag ends                                                                     |
-| `BeginMtn`    | string | Motion triggered when drag begins                                                                   |
+| `BeginMtn`    | string | Motion triggered when drag begins (first drag movement)                                             |
 | `LowPriority` | bool   | Lower priority for this drag handler                                                                |
 | `Weight`      | float  | Drag weight/damping factor                                                                          |
+
+#### Virtual Parameters (Non-Existent Id)
+
+When `Id` references a parameter that doesn't exist in the .moc3 file, ParamHit operates in **drag scrub mode**:
+
+- A virtual parameter value is tracked internally (not applied to the model)
+- `MaxMtn` animation starts immediately on pointerdown and is **scrubbed** based on drag distance
+- `Axis` and `Factor` define the drag-to-progress curve (how many pixels of drag = full animation progress)
+- On release **outside** the hit area: animation plays to completion
+- On release **inside** the hit area: behavior depends on `ReleaseType`:
+  - Type 0/1 (spring back): animation reverts (cancelled)
+  - Type 2/3 (stay/sticky): animation continues from current position
+
+This is the mechanism used by TouchDrag hit areas to scrub animations forward/backward based on drag distance from the initial click point.
 
 ### ParamLoop
 

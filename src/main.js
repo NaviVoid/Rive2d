@@ -130,29 +130,46 @@ const ready = app.init({
       }
       const { item, startPos, startValue } = paramDragging;
       const currentPos = item.axis === 0 ? e.global.x : e.global.y;
-      paramDragging.currentValue = startValue + (currentPos - startPos) * item.factor;
+      const scale = currentModel?.scale.x || 1;
+      paramDragging.currentValue = startValue + (currentPos - startPos) * item.factor * scale;
       return;
     }
     // Model drag — move position + trigger drag motions
     if (!dragging || !currentModel) return;
+    // Drag scrubbing: control animation progress based on drag distance
+    if (dragScrubState) {
+      const item = dragScrubState.item;
+      if (item) {
+        // ParamHit-driven scrub: axis/factor determine drag curve
+        // BeginMtn: trigger on first drag movement past threshold
+        if (!dragScrubState.beginFired && item.beginMtn) {
+          const dx = e.global.x - dragStart.x;
+          const dy = e.global.y - dragStart.y;
+          if (dx * dx + dy * dy >= DRAG_THRESHOLD * DRAG_THRESHOLD) {
+            dragScrubState.beginFired = true;
+            const [g, idx] = item.beginMtn.split(':');
+            console.log(`[motion] drag scrub BeginMtn on ${item.hitArea}: ${g}` + (idx !== undefined ? `:${idx}` : ''));
+            currentModel.motion(g, idx !== undefined ? parseInt(idx) : undefined);
+          }
+        }
+        const delta = item.axis === 0 ? (e.global.x - dragStart.x) : (e.global.y - dragStart.y);
+        const scale = currentModel?.scale.x || 1;
+        const value = delta * item.factor * scale;
+        dragScrubState.progress = Math.max(0, Math.min(1, value));
+      } else {
+        // Convention-based drag scrub: Euclidean distance
+        const dx = e.global.x - dragStart.x;
+        const dy = e.global.y - dragStart.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        dragScrubState.progress = Math.min(1, dist / DRAG_SCRUB_DISTANCE);
+      }
+      return;
+    }
     if (!dragMoved) {
       const dx = e.global.x - dragStart.x;
       const dy = e.global.y - dragStart.y;
       if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;
       dragMoved = true;
-      // Trigger drag motions on first real drag movement
-      if (!dragMotionTriggered && tapMotion) {
-        dragMotionTriggered = true;
-        triggerDragMotions();
-      }
-    }
-    // Drag scrubbing: control animation progress based on distance from start
-    if (dragScrubState) {
-      const dx = e.global.x - dragStart.x;
-      const dy = e.global.y - dragStart.y;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      dragScrubState.progress = Math.min(1, dist / DRAG_SCRUB_DISTANCE);
-      return;
     }
     // lockModel only prevents position changes, not drag motions
     if (lockModel) return;
@@ -586,20 +603,13 @@ function isDragMotion(mapped) {
 // Trigger drag motions for hit areas recorded during pointerdown
 function triggerDragMotions() {
   if (!currentModel) return;
-  // 0. ParamHit items with MaxMtn but no real parameter — use MaxMtn as drag scrub motion
-  for (const name of dragHitNames) {
-    for (const item of paramHitItems) {
-      if (item.hitArea === name && item.paramIndex < 0 && item.maxMtn) {
-        const [group, idxStr] = item.maxMtn.split(':');
-        const arrayIdx = idxStr !== undefined ? parseInt(idxStr) : undefined;
-        console.log(`[motion] drag scrub on ${name}: MaxMtn ${group}` + (arrayIdx !== undefined ? `:${arrayIdx}` : ''));
-        currentModel.motion(group, arrayIdx);
-        pendingNextMtn = (arrayIdx !== undefined && motionNextMap[group]?.[arrayIdx]) || null;
-        dragScrubState = { motion: null, entry: null, duration: 0, progress: 0,
-          scrubGroup: group, scrubIndex: arrayIdx ?? 0, hitArea: name };
-        return;
-      }
-    }
+  function startDragScrub(name, group, arrayIdx) {
+    console.log(`[motion] drag scrub on ${name}: ${group}` + (arrayIdx !== undefined ? `:${arrayIdx}` : ''));
+    dragScrubState = { entry: null, duration: 0, progress: 0, hitArea: name, ready: false, beginFired: false };
+    currentModel.motion(group, arrayIdx).then(() => {
+      if (dragScrubState) dragScrubState.ready = true;
+    });
+    pendingNextMtn = (arrayIdx !== undefined && motionNextMap[group]?.[arrayIdx]) || null;
   }
   for (const name of dragHitNames) {
     // 1. Explicit mapping whose motion group contains "drag" (e.g. Drag*, TouchDrag*)
@@ -607,26 +617,16 @@ function triggerDragMotions() {
     if (mapped && mapped !== '__none__' && isDragMotion(mapped)) {
       const [group, idxStr] = mapped.split(':');
       const arrayIdx = idxStr !== undefined ? parseInt(idxStr) : undefined;
-      console.log(`[motion] drag scrub on ${name}: ${group}` + (arrayIdx !== undefined ? `:${arrayIdx}` : ''));
-      currentModel.motion(group, arrayIdx);
-      pendingNextMtn = (arrayIdx !== undefined && motionNextMap[group]?.[arrayIdx]) || null;
-      dragScrubState = { motion: null, entry: null, duration: 0, progress: 0,
-        scrubGroup: group, scrubIndex: arrayIdx ?? 0, hitArea: name };
+      startDragScrub(name, group, arrayIdx);
       return;
     }
     // 2. Convention fallbacks: Drag + hitAreaName, drag_ + hitAreaName
     if (modelMotions['Drag' + name]) {
-      console.log(`[motion] drag scrub on ${name}: Drag${name}`);
-      currentModel.motion('Drag' + name);
-      dragScrubState = { motion: null, entry: null, duration: 0, progress: 0,
-        scrubGroup: 'Drag' + name, scrubIndex: 0, hitArea: name };
+      startDragScrub(name, 'Drag' + name, undefined);
       return;
     }
     if (modelMotions['drag_' + name]) {
-      console.log(`[motion] drag scrub on ${name}: drag_${name}`);
-      currentModel.motion('drag_' + name);
-      dragScrubState = { motion: null, entry: null, duration: 0, progress: 0,
-        scrubGroup: 'drag_' + name, scrubIndex: 0, hitArea: name };
+      startDragScrub(name, 'drag_' + name, undefined);
       return;
     }
   }
@@ -698,7 +698,6 @@ function handleParamHitRelease() {
     }
   }
   paramDragging = null;
-  dragMoved = false; // reset so next tap isn't blocked
   updateInputRegion();
 }
 
@@ -709,6 +708,8 @@ function handleDragRelease(e) {
       const hitNames = e ? currentModel.hitTest(e.global.x, e.global.y) : [];
       const insideHitArea = hitNames.includes(dragScrubState.hitArea);
       const progress = dragScrubState.progress;
+      const item = dragScrubState.item;
+      const releaseType = item?.releaseType ?? 0;
       if (!insideHitArea && progress > 0) {
         // Released outside hit area — let motion play to completion
         console.log(`[motion] drag scrub complete: progress=${progress.toFixed(2)}, released outside ${dragScrubState.hitArea}`);
@@ -716,8 +717,15 @@ function handleDragRelease(e) {
           const entry = dragScrubState.entry;
           entry.setEndTime(entry.getStartTime() + dragScrubState.duration);
         }
+      } else if (releaseType === 2 || releaseType === 3) {
+        // Stay/sticky: let motion continue from current position
+        console.log(`[motion] drag scrub stay: progress=${progress.toFixed(2)}, releaseType=${releaseType}`);
+        if (dragScrubState.duration > 0) {
+          const entry = dragScrubState.entry;
+          entry.setEndTime(entry.getStartTime() + dragScrubState.duration);
+        }
       } else {
-        // Released inside hit area — revert (stop the motion)
+        // Spring back (type 0/1): revert (stop the motion)
         console.log(`[motion] drag scrub reverted: progress=${progress.toFixed(2)}, released inside ${dragScrubState.hitArea}`);
         dragScrubState.entry.setIsFinished(true);
         pendingNextMtn = null;
@@ -725,10 +733,19 @@ function handleDragRelease(e) {
     } else {
       console.log('[motion] drag scrub cancelled (motion not loaded)');
     }
+    // EndMtn: triggered when drag scrub ends
+    if (dragScrubState.item?.endMtn) {
+      const [group, idxStr] = dragScrubState.item.endMtn.split(':');
+      console.log(`[motion] drag scrub EndMtn on ${dragScrubState.hitArea}: ${group}` + (idxStr !== undefined ? `:${idxStr}` : ''));
+      currentModel.motion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
+    }
     dragScrubState = null;
+    dragging = false;
+    // keep dragMoved = true to suppress pointertap after scrub
+    updateInputRegion();
+    return;
   }
   dragging = false;
-  dragMoved = false;
   if (!lockModel) savePosition();
   updateInputRegion();
 }
@@ -812,12 +829,14 @@ async function loadModel(modelPath) {
       // Check for ParamHit drag areas first
       if (paramHitItems.length > 0) {
         const hitNames = sortHitNames(model.hitTest(e.global.x, e.global.y));
-        for (const item of paramHitItems) {
-          if (hitNames.includes(item.hitArea) && item.paramIndex >= 0) {
+        for (const name of hitNames) {
+          const item = paramHitItems.find(i => i.hitArea === name);
+          if (!item) continue;
+          if (item.paramIndex >= 0) {
+            // Real parameter: drag to control parameter value
             console.log(`[touch] pointerdown on ParamHit area: ${item.hitArea} (param: ${item.paramId})`);
             const coreModel = model.internalModel.coreModel;
-            const startValue = item.paramIndex >= 0
-              ? coreModel.getParameterValueByIndex(item.paramIndex) : 0;
+            const startValue = coreModel.getParameterValueByIndex(item.paramIndex);
             paramDragging = {
               item,
               startPos: item.axis === 0 ? e.global.x : e.global.y,
@@ -832,6 +851,22 @@ async function loadModel(modelPath) {
             dragStart.y = e.global.y;
             setFullInputRegion();
             return;
+          } else if (item.maxMtn) {
+            // Virtual parameter: drag scrub MaxMtn animation
+            console.log(`[touch] pointerdown on ParamHit area: ${item.hitArea} (virtual param, scrub ${item.maxMtn})`);
+            const [group, idxStr] = item.maxMtn.split(':');
+            const arrayIdx = idxStr !== undefined ? parseInt(idxStr) : undefined;
+            dragScrubState = { entry: null, duration: 0, progress: 0, hitArea: item.hitArea, ready: false, item, beginFired: false };
+            model.motion(group, arrayIdx).then(() => {
+              if (dragScrubState) dragScrubState.ready = true;
+            });
+            pendingNextMtn = (arrayIdx !== undefined && motionNextMap[group]?.[arrayIdx]) || null;
+            dragging = true;
+            dragMoved = true; // suppress pointertap
+            dragStart.x = e.global.x;
+            dragStart.y = e.global.y;
+            setFullInputRegion();
+            return;
           }
         }
       }
@@ -839,12 +874,24 @@ async function loadModel(modelPath) {
       // Record hit areas for drag-motion detection
       dragHitNames = sortHitNames(model.hitTest(e.global.x, e.global.y));
       dragMotionTriggered = false;
-      console.log(`[touch] pointerdown — drag hit areas: [${dragHitNames.join(', ')}]`);
-
-      dragging = true;
-      dragMoved = false;
       dragStart.x = e.global.x;
       dragStart.y = e.global.y;
+
+      // Trigger convention-based drag motions (hitMotionMap drag groups)
+      if (tapMotion) {
+        triggerDragMotions();
+      }
+      if (dragScrubState) {
+        console.log(`[touch] pointerdown — drag scrub started on [${dragHitNames.join(', ')}]`);
+        dragging = true;
+        dragMoved = true; // suppress pointertap
+        setFullInputRegion();
+        return;
+      }
+
+      console.log(`[touch] pointerdown — drag hit areas: [${dragHitNames.join(', ')}]`);
+      dragging = true;
+      dragMoved = false;
       dragOffset.x = e.global.x - model.x;
       dragOffset.y = e.global.y - model.y;
       setFullInputRegion();
@@ -940,11 +987,27 @@ async function loadModel(modelPath) {
     // point in the update cycle (after motions, before physics/coreModel.update)
     const origMotionUpdate = model.internalModel.motionManager.update;
     model.internalModel.motionManager.update = function (...args) {
+      // Drag motion scrubbing: find queue entry once model.motion() Promise resolved
+      if (dragScrubState && !dragScrubState.entry && dragScrubState.ready) {
+        const entries = model.internalModel.motionManager.queueManager.getCubismMotionQueueEntries();
+        for (let i = 0; i < entries.getSize(); i++) {
+          const entry = entries.at(i);
+          if (entry && entry._motion && !entry.isFinished()) {
+            dragScrubState.entry = entry;
+            const dur = entry._motion.getDuration();
+            dragScrubState.duration = dur > 0 ? dur : entry._motion.getLoopDuration();
+            entry.setEndTime(-1);
+            console.log(`[motion] drag scrub entry found: duration=${dragScrubState.duration.toFixed(3)}s`);
+            break;
+          }
+        }
+      }
       // Drag motion scrubbing: freeze motion at desired progress before update
       if (dragScrubState && dragScrubState.entry && !dragScrubState.entry.isFinished()) {
         const now = args[1]; // time in seconds (converted by CubismInternalModel)
         const targetTime = dragScrubState.progress * dragScrubState.duration;
         dragScrubState.entry.setStartTime(now - targetTime);
+        dragScrubState.entry.setEndTime(-1); // prevent auto-finish every frame
       }
       origMotionUpdate.apply(this, args);
       const cm = model.internalModel.coreModel;
@@ -993,26 +1056,6 @@ async function loadModel(modelPath) {
       if (fileLoopMap[group]?.[index]) {
         motion.setLoop(true);
         motion.setLoopFadeIn(false);
-      }
-      // Capture motion for drag scrubbing
-      if (dragScrubState && !dragScrubState.motion
-          && group === dragScrubState.scrubGroup
-          && index === dragScrubState.scrubIndex) {
-        dragScrubState.motion = motion;
-        const dur = motion.getDuration();
-        dragScrubState.duration = dur > 0 ? dur : motion.getLoopDuration();
-        // Find the queue entry for this motion
-        const entries = model.internalModel.motionManager.queueManager.getCubismMotionQueueEntries();
-        for (let i = 0; i < entries.getSize(); i++) {
-          const entry = entries.at(i);
-          if (entry && entry._motion === motion) {
-            dragScrubState.entry = entry;
-            // Disable auto-finish by setting endTime to -1
-            entry.setEndTime(-1);
-            break;
-          }
-        }
-        console.log(`[motion] drag scrub captured: group=${group}, index=${index}, duration=${dragScrubState.duration.toFixed(3)}s`);
       }
     });
 
