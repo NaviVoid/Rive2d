@@ -11,6 +11,7 @@ const showBorder = ref(false);
 const tapMotion = ref(true);
 const showHitAreas = ref(false);
 const lockModel = ref(false);
+const mouseTracking = ref(true);
 const previews = ref({});
 
 // Detail view state
@@ -96,6 +97,7 @@ async function refreshConfig() {
     tapMotion.value = config.tap_motion;
     showHitAreas.value = config.show_hit_areas;
     lockModel.value = config.lock_model;
+    mouseTracking.value = config.mouse_tracking;
     loadPreviews(config.models);
     loadCustomNames(config.models);
   } catch (err) {
@@ -193,6 +195,14 @@ async function toggleLockPosition() {
   await invoke('set_setting', {
     key: 'lock_model',
     value: lockModel.value ? 'true' : 'false',
+  });
+}
+
+async function toggleMouseTracking() {
+  mouseTracking.value = !mouseTracking.value;
+  await invoke('set_setting', {
+    key: 'mouse_tracking',
+    value: mouseTracking.value ? 'true' : 'false',
   });
 }
 
@@ -309,6 +319,12 @@ onMounted(refreshConfig);
     </template>
 
     <section v-if="activeTab === 'settings'" class="settings-panel">
+      <div class="setting-row" @click="toggleMouseTracking">
+        <span class="setting-label">Mouse tracking</span>
+        <div class="toggle" :class="{ on: mouseTracking }">
+          <div class="toggle-knob" />
+        </div>
+      </div>
       <div class="setting-row" @click="toggleTapMotion">
         <span class="setting-label">Enable tap motions</span>
         <div class="toggle" :class="{ on: tapMotion }">

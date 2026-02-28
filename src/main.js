@@ -61,6 +61,7 @@ let showBorder = false;
 let tapMotion = true;
 let showHitAreas = false;
 let lockModel = false;
+let mouseTracking = true;
 let hitMotionMap = {};
 let motionNameToIndex = {};  // { group: { name: arrayIndex } }
 let motionNextMap = {};      // { group: { arrayIndex: nextMtnString } }
@@ -172,6 +173,7 @@ invoke('get_config').then((config) => {
   tapMotion = config.tap_motion;
   showHitAreas = config.show_hit_areas;
   lockModel = config.lock_model;
+  mouseTracking = config.mouse_tracking;
 }).catch(() => {});
 
 listen('load-model', async (event) => {
@@ -197,6 +199,28 @@ listen('motions-changed', async (event) => {
   buildHitMotionMap(rawHitAreas, customJsonStr);
 });
 
+listen('unload-model', async () => {
+  await ready;
+  if (currentModel) {
+    app.ticker.remove(drawHitAreas);
+    hitAreaGfx.clear();
+    for (const label of hitAreaLabels) label.visible = false;
+    borderGfx.clear();
+    app.stage.removeChild(currentModel);
+    const modelKeys = [...Assets.cache._cache.keys()].filter(k => k.startsWith('model://'));
+    for (const key of modelKeys) Assets.cache.remove(key);
+    currentModel.destroy();
+    currentModel = null;
+    currentModelPath = null;
+    hitMotionMap = {};
+    motionNameToIndex = {};
+    motionNextMap = {};
+    pendingNextMtn = null;
+    // Clear input region so clicks pass through
+    invoke('update_input_region', { x: 0, y: 0, width: 0, height: 0 }).catch(() => {});
+  }
+});
+
 listen('setting-changed', (event) => {
   const [key, value] = event.payload;
   if (key === 'show_border') {
@@ -212,6 +236,15 @@ listen('setting-changed', (event) => {
   }
   if (key === 'lock_model') {
     lockModel = value === 'true';
+  }
+  if (key === 'mouse_tracking') {
+    mouseTracking = value === 'true';
+    if (currentModel) {
+      currentModel.automator.autoFocus = mouseTracking;
+      if (!mouseTracking) {
+        currentModel.internalModel.focusController.focus(0, 0);
+      }
+    }
   }
 });
 
@@ -346,6 +379,10 @@ function showContextMenu(x, y) {
     toggle: showHitAreas,
     action: () => invoke('set_setting', { key: 'show_hit_areas', value: String(!showHitAreas) }),
   }));
+  ctxMenu.appendChild(createMenuItem('Mouse Tracking', {
+    toggle: mouseTracking,
+    action: () => invoke('set_setting', { key: 'mouse_tracking', value: String(!mouseTracking) }),
+  }));
   ctxMenu.appendChild(createMenuItem('Lock Model', {
     toggle: lockModel,
     action: () => invoke('set_setting', { key: 'lock_model', value: String(!lockModel) }),
@@ -468,7 +505,7 @@ async function loadModel(modelPath) {
   try {
     const model = await Live2DModel.from(modelPath, {
       autoHitTest: false,
-      autoFocus: true,
+      autoFocus: mouseTracking,
     });
 
     // Guard against textures with destroyed/missing source — the library
@@ -594,6 +631,8 @@ async function loadModel(modelPath) {
     showBorder = config.show_border;
     showHitAreas = config.show_hit_areas;
     lockModel = config.lock_model;
+    mouseTracking = config.mouse_tracking;
+    model.automator.autoFocus = mouseTracking;
 
     updateBorder();
     updateInputRegion();

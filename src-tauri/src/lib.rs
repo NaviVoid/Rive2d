@@ -394,7 +394,17 @@ fn collect_lpk_files(
 
 #[tauri::command]
 fn remove_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    // Check if this is the currently loaded model before removing
+    let is_current = config::get_setting(&app, "current_model")
+        .map(|v| v == path)
+        .unwrap_or(false);
+
     config::remove_model(&app, &path);
+
+    if is_current {
+        app.emit("unload-model", ()).ok();
+    }
+
     Ok(())
 }
 

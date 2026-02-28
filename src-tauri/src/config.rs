@@ -14,6 +14,7 @@ pub struct AppConfig {
     pub tap_motion: bool,
     pub show_hit_areas: bool,
     pub lock_model: bool,
+    pub mouse_tracking: bool,
 }
 
 fn db_path(app: &tauri::AppHandle) -> PathBuf {
@@ -136,6 +137,15 @@ pub fn load(app: &tauri::AppHandle) -> AppConfig {
         .map(|v| v == "true")
         .unwrap_or(false);
 
+    let mouse_tracking: bool = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'mouse_tracking'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|v| v == "true")
+        .unwrap_or(true);
+
     AppConfig {
         current_model,
         models,
@@ -146,6 +156,7 @@ pub fn load(app: &tauri::AppHandle) -> AppConfig {
         tap_motion,
         show_hit_areas,
         lock_model,
+        mouse_tracking,
     }
 }
 
