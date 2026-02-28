@@ -91,6 +91,8 @@ const ready = app.init({
   backgroundColor: 0x000000,
   resizeTo: window,
   antialias: true,
+  resolution: window.devicePixelRatio || 1,
+  autoDensity: true,
   preference: 'webgl',   // WebKitGTK has no WebGPU
 }).then(() => {
   app.stage.addChild(hitAreaContainer);
