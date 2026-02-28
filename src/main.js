@@ -636,6 +636,13 @@ async function loadModel(modelPath) {
 
     updateBorder();
     updateInputRegion();
+
+    // Play start motion if the model has one
+    const motions = rawJson.FileReferences?.Motions || rawJson.motions || {};
+    const startGroup = motions['Start'] ? 'Start' : motions['start'] ? 'start' : null;
+    if (startGroup) {
+      model.motion(startGroup, 0);
+    }
   } catch (err) {
     console.error('[rive2d] Failed to load model:', err);
   }
