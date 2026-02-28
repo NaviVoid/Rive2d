@@ -65,6 +65,7 @@ let mouseTracking = true;
 let hitMotionMap = {};
 let motionNameToIndex = {};  // { group: { name: arrayIndex } }
 let motionNextMap = {};      // { group: { arrayIndex: nextMtnString } }
+let fileLoopMap = {};        // { group: { arrayIndex: true } } — motions with FileLoop
 let pendingNextMtn = null;
 let idleGroup = null;         // name of Idle motion group (e.g. 'Idle', 'idle')
 let currentModelPath = null;
@@ -77,6 +78,9 @@ let playingStart = false;     // true while start animation is playing
 let paramHitItems = [];      // ParamHit controller items parsed from model JSON
 let paramDragging = null;    // { item, startPos, paramIndex, startValue, currentValue }
 let paramReleaseAnims = [];  // parameter reset animations after drag release
+let dragHitNames = [];       // hit area names recorded on pointerdown for drag-motion detection
+let dragMotionTriggered = false; // true once a drag motion has been triggered during current drag
+let modelMotions = {};       // motion groups from raw model JSON (for drag convention lookup)
 
 // Graphics overlays (drawn on top of model)
 const borderGfx = new PIXI.Graphics();
@@ -126,6 +130,11 @@ const ready = app.init({
       const dy = e.global.y - dragStart.y;
       if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;
       dragMoved = true;
+      // Trigger drag motions on first real drag movement
+      if (!dragMotionTriggered && tapMotion) {
+        dragMotionTriggered = true;
+        triggerDragMotions();
+      }
     }
     currentModel.x = e.global.x - dragOffset.x;
     currentModel.y = e.global.y - dragOffset.y;
@@ -252,12 +261,16 @@ listen('unload-model', async () => {
     hitMotionMap = {};
     motionNameToIndex = {};
     motionNextMap = {};
+    fileLoopMap = {};
     pendingNextMtn = null;
     idleGroup = null;
     playingStart = false;
     paramHitItems = [];
     paramDragging = null;
     paramReleaseAnims = [];
+    dragHitNames = [];
+    dragMotionTriggered = false;
+    modelMotions = {};
     // Clear input region so clicks pass through
     invoke('update_input_region', { x: 0, y: 0, width: 0, height: 0 }).catch(() => {});
   }
@@ -497,6 +510,7 @@ function buildMotionMaps(rawJson) {
   const motions = rawJson.FileReferences?.Motions || rawJson.motions || {};
   motionNameToIndex = {};
   motionNextMap = {};
+  fileLoopMap = {};
   for (const [group, entries] of Object.entries(motions)) {
     if (!Array.isArray(entries)) continue;
     motionNameToIndex[group] = {};
@@ -504,6 +518,10 @@ function buildMotionMaps(rawJson) {
     for (let i = 0; i < entries.length; i++) {
       if (entries[i].Name) motionNameToIndex[group][entries[i].Name] = i;
       if (entries[i].NextMtn) motionNextMap[group][i] = entries[i].NextMtn;
+      if (entries[i].FileLoop) {
+        if (!fileLoopMap[group]) fileLoopMap[group] = {};
+        fileLoopMap[group][i] = true;
+      }
     }
   }
 }
@@ -525,6 +543,41 @@ function buildHitMotionMap(rawHitAreas, customJson) {
     if (n && h.Motion) hitMotionMap[n] = resolveMotionRef(h.Motion);
   }
   if (customJson) Object.assign(hitMotionMap, JSON.parse(customJson));
+}
+
+// Check if a mapped motion is a drag-type motion (by motion group name only)
+function isDragMotion(mapped) {
+  if (!mapped || mapped === '__none__') return false;
+  const group = mapped.split(':')[0];
+  return /^[Dd]rag/.test(group);
+}
+
+// Trigger drag motions for hit areas recorded during pointerdown
+function triggerDragMotions() {
+  if (!currentModel) return;
+  for (const name of dragHitNames) {
+    // 1. Explicit mapping whose motion group starts with "Drag"
+    const mapped = hitMotionMap[name];
+    if (mapped && mapped !== '__none__' && isDragMotion(mapped)) {
+      const [group, idxStr] = mapped.split(':');
+      const arrayIdx = idxStr !== undefined ? parseInt(idxStr) : undefined;
+      console.log(`[motion] drag on ${name}: ${group}` + (arrayIdx !== undefined ? `:${arrayIdx}` : ''));
+      currentModel.motion(group, arrayIdx);
+      pendingNextMtn = (arrayIdx !== undefined && motionNextMap[group]?.[arrayIdx]) || null;
+      return;
+    }
+    // 2. Convention fallbacks: Drag + hitAreaName, drag_ + hitAreaName
+    if (modelMotions['Drag' + name]) {
+      console.log(`[motion] drag on ${name}: Drag${name}`);
+      currentModel.motion('Drag' + name);
+      return;
+    }
+    if (modelMotions['drag_' + name]) {
+      console.log(`[motion] drag on ${name}: drag_${name}`);
+      currentModel.motion('drag_' + name);
+      return;
+    }
+  }
 }
 
 // Follow Command "start_mtn" redirects to find the actual motion
@@ -549,8 +602,8 @@ function handleParamHitRelease() {
   if (dragMoved) {
     if (item.maxMtn) {
       const coreModel = currentModel.internalModel.coreModel;
-      const max = coreModel.getParameterMaximumValue(paramIndex);
-      const min = coreModel.getParameterMinimumValue(paramIndex);
+      const max = paramIndex >= 0 ? coreModel.getParameterMaximumValue(paramIndex) : 1;
+      const min = paramIndex >= 0 ? coreModel.getParameterMinimumValue(paramIndex) : -1;
       const range = max - min;
       // Check both extremes — factor sign determines drag direction
       const atMax = currentValue >= max - range * 0.1;
@@ -563,7 +616,7 @@ function handleParamHitRelease() {
         currentModel.motion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
       }
     }
-    if (item.releaseType === 0) {
+    if (item.releaseType === 0 && paramIndex >= 0) {
       const coreModel = currentModel.internalModel.coreModel;
       paramReleaseAnims.push({
         paramIndex,
@@ -657,7 +710,8 @@ async function loadModel(modelPath) {
         for (const item of paramHitItems) {
           if (hitNames.includes(item.hitArea)) {
             const coreModel = model.internalModel.coreModel;
-            const startValue = coreModel.getParameterValueByIndex(item.paramIndex);
+            const startValue = item.paramIndex >= 0
+              ? coreModel.getParameterValueByIndex(item.paramIndex) : 0;
             paramDragging = {
               item,
               startPos: item.axis === 0 ? e.global.x : e.global.y,
@@ -676,6 +730,10 @@ async function loadModel(modelPath) {
         }
       }
 
+      // Record hit areas for drag-motion detection
+      dragHitNames = model.hitTest(e.global.x, e.global.y);
+      dragMotionTriggered = false;
+
       dragging = true;
       dragMoved = false;
       dragStart.x = e.global.x;
@@ -690,6 +748,7 @@ async function loadModel(modelPath) {
     const rawJson = model.internalModel.settings.json;
     const rawHitAreas = rawJson.HitAreas || rawJson.hitAreas || rawJson.hit_areas || [];
     buildMotionMaps(rawJson);
+    modelMotions = rawJson.FileReferences?.Motions || rawJson.motions || {};
 
     // Load custom motion overrides from settings
     currentModelPath = modelPath.replace('model://localhost/', '');
@@ -709,11 +768,10 @@ async function loadModel(modelPath) {
       for (const item of items) {
         const paramId = item.Id || item.id;
         const paramIndex = coreModel.getParameterIndex(paramId);
-        if (paramIndex < 0) continue;
         paramHitItems.push({
           hitArea: item.HitArea || item.hitArea,
           paramId,
-          paramIndex,
+          paramIndex, // may be -1 if parameter doesn't exist in moc3
           axis: item.Axis ?? 0,
           factor: item.Factor ?? 0.04,
           releaseType: item.ReleaseType ?? 0,
@@ -729,7 +787,7 @@ async function loadModel(modelPath) {
     model.internalModel.motionManager.update = function (...args) {
       origMotionUpdate.apply(this, args);
       const cm = model.internalModel.coreModel;
-      if (paramDragging) {
+      if (paramDragging && paramDragging.paramIndex >= 0) {
         cm.setParameterValueByIndex(paramDragging.paramIndex, paramDragging.currentValue);
       }
       for (const anim of paramReleaseAnims) {
@@ -739,6 +797,14 @@ async function loadModel(modelPath) {
       }
       paramReleaseAnims = paramReleaseAnims.filter(a => a.t < 1);
     };
+
+    // Set loop flag on motions with FileLoop: true in model JSON
+    model.internalModel.motionManager.on('motionLoaded', (group, index, motion) => {
+      if (fileLoopMap[group]?.[index]) {
+        motion.setLoop(true);
+        motion.setLoopFadeIn(false);
+      }
+    });
 
     // NextMtn chaining: when a motion finishes, play its NextMtn if set
     model.internalModel.motionManager.on('motionFinish', () => {
@@ -767,6 +833,8 @@ async function loadModel(modelPath) {
         const mapped = hitMotionMap[name];
         // Custom override: __none__ means do nothing
         if (mapped === '__none__') continue;
+        // Skip drag-type motions — they trigger on drag, not tap
+        if (isDragMotion(mapped)) continue;
         // Explicit mapping (from model JSON or custom override)
         if (mapped) {
           const [group, idxStr] = mapped.split(':');
@@ -775,7 +843,7 @@ async function loadModel(modelPath) {
           model.motion(group, arrayIdx);
           // Queue NextMtn if this motion has one
           pendingNextMtn = (arrayIdx !== undefined && motionNextMap[group]?.[arrayIdx]) || null;
-          continue;
+          return; // stop — don't trigger overlapping hit areas
         }
         // Convention fallbacks (only when no explicit mapping)
         console.log(`[motion] tap on ${name}: trying conventions`);
@@ -791,6 +859,7 @@ async function loadModel(modelPath) {
         if (stripped !== name) {
           model.motion(stripped.toLowerCase());
         }
+        return; // stop — don't trigger overlapping hit areas
       }
     });
 
