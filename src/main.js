@@ -66,6 +66,7 @@ let hitMotionMap = {};
 let motionNameToIndex = {};  // { group: { name: arrayIndex } }
 let motionNextMap = {};      // { group: { arrayIndex: nextMtnString } }
 let pendingNextMtn = null;
+let idleGroup = null;         // name of Idle motion group (e.g. 'Idle', 'idle')
 let currentModelPath = null;
 let dragging = false;
 let dragMoved = false;
@@ -231,6 +232,7 @@ listen('trigger-motion', async (event) => {
   await ready;
   if (!currentModel) return;
   const [group, index] = event.payload;
+  console.log(`[motion] trigger from settings: ${group}` + (index != null ? `:${index}` : ''));
   currentModel.motion(group, index ?? undefined);
 });
 
@@ -251,6 +253,7 @@ listen('unload-model', async () => {
     motionNameToIndex = {};
     motionNextMap = {};
     pendingNextMtn = null;
+    idleGroup = null;
     playingStart = false;
     paramHitItems = [];
     paramDragging = null;
@@ -556,6 +559,7 @@ function handleParamHitRelease() {
       const moved = Math.abs(currentValue - startValue);
       if (range > 0 && (atMax || atMin) && moved > range * 0.3) {
         const [group, idxStr] = item.maxMtn.split(':');
+        console.log(`[motion] drag MaxMtn on ${item.hitArea}: ${group}` + (idxStr !== undefined ? `:${idxStr}` : ''));
         currentModel.motion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
       }
     }
@@ -745,6 +749,9 @@ async function loadModel(modelPath) {
         const resolved = resolveMotionRef(mtn);
         const [group, idxStr] = resolved.split(':');
         model.motion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
+      } else if (idleGroup) {
+        // Loop idle animation when no other motion is queued
+        model.motion(idleGroup, undefined, 1); // IDLE priority, random index
       }
     });
 
@@ -764,12 +771,14 @@ async function loadModel(modelPath) {
         if (mapped) {
           const [group, idxStr] = mapped.split(':');
           const arrayIdx = idxStr !== undefined ? parseInt(idxStr) : undefined;
+          console.log(`[motion] tap on ${name}: ${group}` + (arrayIdx !== undefined ? `:${arrayIdx}` : ''));
           model.motion(group, arrayIdx);
           // Queue NextMtn if this motion has one
           pendingNextMtn = (arrayIdx !== undefined && motionNextMap[group]?.[arrayIdx]) || null;
           continue;
         }
         // Convention fallbacks (only when no explicit mapping)
+        console.log(`[motion] tap on ${name}: trying conventions`);
         pendingNextMtn = null;
         // Cubism 2: hit area "body" → motion "tap_body"
         model.motion('tap_' + name);
@@ -806,12 +815,16 @@ async function loadModel(modelPath) {
     updateBorder();
     updateInputRegion();
 
-    // Play start motion if the model has one
+    // Detect idle and start motion groups
     const motions = rawJson.FileReferences?.Motions || rawJson.motions || {};
+    idleGroup = motions['Idle'] ? 'Idle' : motions['idle'] ? 'idle' : null;
+
     const startGroup = motions['Start'] ? 'Start' : motions['start'] ? 'start' : null;
     if (startGroup) {
       playingStart = true;
       model.motion(startGroup, 0, 1); // priority IDLE so taps can interrupt
+    } else if (idleGroup) {
+      model.motion(idleGroup, undefined, 1); // start idle loop immediately
     }
   } catch (err) {
     console.error('[rive2d] Failed to load model:', err);
