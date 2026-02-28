@@ -62,6 +62,9 @@ let tapMotion = true;
 let showHitAreas = false;
 let lockModel = false;
 let hitMotionMap = {};
+let motionNameToIndex = {};  // { group: { name: arrayIndex } }
+let motionNextMap = {};      // { group: { arrayIndex: nextMtnString } }
+let pendingNextMtn = null;
 let currentModelPath = null;
 let dragging = false;
 let dragMoved = false;
@@ -185,18 +188,13 @@ listen('reset-position', async () => {
 listen('motions-changed', async (event) => {
   const changedPath = event.payload;
   if (!currentModel || changedPath !== currentModelPath) return;
-  // Rebuild hitMotionMap from model defaults + new custom overrides
   const rawJson = currentModel.internalModel.settings.json;
   const rawHitAreas = rawJson.HitAreas || rawJson.hitAreas || rawJson.hit_areas || [];
-  hitMotionMap = {};
-  for (const h of rawHitAreas) {
-    const n = h.Name || h.name;
-    if (n && h.Motion) hitMotionMap[n] = h.Motion;
-  }
+  let customJsonStr = null;
   try {
-    const customJson = await invoke('get_custom_motions', { path: changedPath });
-    if (customJson) Object.assign(hitMotionMap, JSON.parse(customJson));
+    customJsonStr = await invoke('get_custom_motions', { path: changedPath });
   } catch {}
+  buildHitMotionMap(rawHitAreas, customJsonStr);
 });
 
 listen('setting-changed', (event) => {
@@ -408,6 +406,43 @@ function savePosition() {
   invoke('set_setting', { key: 'model_y', value: String(currentModel.y) });
 }
 
+// --- Motion map helpers ---
+
+// Build motionNameToIndex and motionNextMap from raw model JSON
+function buildMotionMaps(rawJson) {
+  const motions = rawJson.FileReferences?.Motions || rawJson.motions || {};
+  motionNameToIndex = {};
+  motionNextMap = {};
+  for (const [group, entries] of Object.entries(motions)) {
+    if (!Array.isArray(entries)) continue;
+    motionNameToIndex[group] = {};
+    motionNextMap[group] = {};
+    for (let i = 0; i < entries.length; i++) {
+      if (entries[i].Name) motionNameToIndex[group][entries[i].Name] = i;
+      if (entries[i].NextMtn) motionNextMap[group][i] = entries[i].NextMtn;
+    }
+  }
+}
+
+// Resolve a "group:Name" reference to "group:arrayIndex"
+function resolveMotionRef(ref) {
+  const [group, name] = ref.split(':');
+  if (name !== undefined && motionNameToIndex[group]?.[name] !== undefined) {
+    return group + ':' + motionNameToIndex[group][name];
+  }
+  return ref;
+}
+
+// Build hitMotionMap from raw hit areas + optional custom overrides JSON
+function buildHitMotionMap(rawHitAreas, customJson) {
+  hitMotionMap = {};
+  for (const h of rawHitAreas) {
+    const n = h.Name || h.name;
+    if (n && h.Motion) hitMotionMap[n] = resolveMotionRef(h.Motion);
+  }
+  if (customJson) Object.assign(hitMotionMap, JSON.parse(customJson));
+}
+
 // --- Model loading ---
 
 async function loadModel(modelPath) {
@@ -487,22 +522,30 @@ async function loadModel(modelPath) {
     });
 
     // Tap to trigger motions (gated by tapMotion toggle)
-    // Build hit area → Motion field map from raw model JSON, since the
-    // engine's normalizeHitAreaDefs drops the Motion field.
+    // Build motion name→index and NextMtn maps from raw model JSON
     const rawJson = model.internalModel.settings.json;
     const rawHitAreas = rawJson.HitAreas || rawJson.hitAreas || rawJson.hit_areas || [];
-    hitMotionMap = {};
-    for (const h of rawHitAreas) {
-      const n = h.Name || h.name;
-      if (n && h.Motion) hitMotionMap[n] = h.Motion;
-    }
+    buildMotionMaps(rawJson);
 
     // Load custom motion overrides from settings
     currentModelPath = modelPath.replace('model://localhost/', '');
+    let customJsonStr = null;
     try {
-      const customJson = await invoke('get_custom_motions', { path: currentModelPath });
-      if (customJson) Object.assign(hitMotionMap, JSON.parse(customJson));
+      customJsonStr = await invoke('get_custom_motions', { path: currentModelPath });
     } catch {}
+    buildHitMotionMap(rawHitAreas, customJsonStr);
+    pendingNextMtn = null;
+
+    // NextMtn chaining: when a motion finishes, play its NextMtn if set
+    model.internalModel.motionManager.on('motionFinish', () => {
+      if (pendingNextMtn) {
+        const mtn = pendingNextMtn;
+        pendingNextMtn = null;
+        const resolved = resolveMotionRef(mtn);
+        const [group, idxStr] = resolved.split(':');
+        model.motion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
+      }
+    });
 
     model.on('pointertap', (e) => {
       if (!tapMotion || dragMoved) return;
@@ -513,11 +556,15 @@ async function loadModel(modelPath) {
         if (mapped === '__none__') continue;
         // Explicit mapping (from model JSON or custom override)
         if (mapped) {
-          const [group, idx] = mapped.split(':');
-          model.motion(group, idx !== undefined ? parseInt(idx) : undefined);
+          const [group, idxStr] = mapped.split(':');
+          const arrayIdx = idxStr !== undefined ? parseInt(idxStr) : undefined;
+          model.motion(group, arrayIdx);
+          // Queue NextMtn if this motion has one
+          pendingNextMtn = (arrayIdx !== undefined && motionNextMap[group]?.[arrayIdx]) || null;
           continue;
         }
         // Convention fallbacks (only when no explicit mapping)
+        pendingNextMtn = null;
         // Cubism 2: hit area "body" → motion "tap_body"
         model.motion('tap_' + name);
         // Direct: name as motion group
