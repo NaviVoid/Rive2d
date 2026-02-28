@@ -1,6 +1,5 @@
 import * as PIXI from 'pixi.js';
 import { Live2DModel } from 'untitled-pixi-live2d-engine';
-import { HitAreaFrames } from 'untitled-pixi-live2d-engine/extra';
 
 // Expose PIXI globally for pixi-live2d-display
 window.PIXI = PIXI;
@@ -41,16 +40,17 @@ const canvas = document.getElementById('canvas');
 const app = new PIXI.Application();
 
 let currentModel = null;
-let hitAreaFrames = null;
 let showBorder = false;
 let tapMotion = true;
 let showHitAreas = false;
 let lockModel = false;
 let dragging = false;
+let dragMoved = false;
 let dragOffset = { x: 0, y: 0 };
 
-// Border graphics overlay (drawn on top of model)
+// Graphics overlays (drawn on top of model)
 const borderGfx = new PIXI.Graphics();
+const hitAreaGfx = new PIXI.Graphics();
 
 // init() is async; listeners registered before it so events aren't missed
 const ready = app.init({
@@ -61,6 +61,7 @@ const ready = app.init({
   antialias: true,
   preference: 'webgl',   // WebKitGTK has no WebGPU
 }).then(() => {
+  app.stage.addChild(hitAreaGfx);
   app.stage.addChild(borderGfx);
 
   // Make stage interactive for drag move/up events
@@ -71,6 +72,7 @@ const ready = app.init({
 
   app.stage.on('pointermove', (e) => {
     if (!dragging || !currentModel) return;
+    dragMoved = true;
     currentModel.x = e.global.x - dragOffset.x;
     currentModel.y = e.global.y - dragOffset.y;
     updateBorder();
@@ -156,7 +158,7 @@ listen('setting-changed', (event) => {
   }
   if (key === 'show_hit_areas') {
     showHitAreas = value === 'true';
-    updateHitAreaFrames();
+    drawHitAreas();
   }
   if (key === 'lock_model') {
     lockModel = value === 'true';
@@ -196,11 +198,42 @@ function updateBorder() {
   borderGfx.stroke({ width: 2, color: 0xff0000, alpha: 1 });
 }
 
-// --- Hit area frames ---
+// --- Hit area drawing ---
 
-function updateHitAreaFrames() {
-  if (hitAreaFrames) {
-    hitAreaFrames.visible = showHitAreas;
+const hitAreaBounds = { x: 0, y: 0, width: 0, height: 0 };
+
+function drawHitAreas() {
+  hitAreaGfx.clear();
+  if (!currentModel || !showHitAreas) return;
+
+  const internalModel = currentModel.internalModel;
+  const hitAreas = internalModel.hitAreas;
+  const transform = internalModel.localTransform;
+  const wt = currentModel.worldTransform;
+
+  for (const name of Object.keys(hitAreas)) {
+    const hitArea = hitAreas[name];
+    let drawIndex = hitArea.index;
+    if (drawIndex < 0) {
+      drawIndex = internalModel.getDrawableIndex(hitArea.id);
+      if (drawIndex < 0) continue;
+      hitArea.index = drawIndex;
+    }
+
+    const b = internalModel.getDrawableBounds(drawIndex, hitAreaBounds);
+    // Transform from model canvas space → model local space
+    const lx = b.x * transform.a + transform.tx;
+    const ly = b.y * transform.d + transform.ty;
+    const lw = b.width * transform.a;
+    const lh = b.height * transform.d;
+    // Transform from model local space → screen space
+    const sx = lx * wt.a + ly * wt.c + wt.tx;
+    const sy = lx * wt.b + ly * wt.d + wt.ty;
+    const sw = lw * wt.a;
+    const sh = lh * wt.d;
+
+    hitAreaGfx.rect(sx, sy, sw, sh);
+    hitAreaGfx.stroke({ width: 2, color: 0xe3a2ff, alpha: 0.8 });
   }
 }
 
@@ -224,15 +257,16 @@ function savePosition() {
 
 async function loadModel(modelPath) {
   if (currentModel) {
+    app.ticker.remove(drawHitAreas);
+    hitAreaGfx.clear();
     app.stage.removeChild(currentModel);
     currentModel.destroy();
     currentModel = null;
-    hitAreaFrames = null;
   }
 
   try {
     const model = await Live2DModel.from(modelPath, {
-      autoHitTest: true,
+      autoHitTest: false,
       autoFocus: true,
     });
 
@@ -266,17 +300,20 @@ async function loadModel(modelPath) {
     model.on('pointerdown', (e) => {
       if (lockModel) return;
       dragging = true;
+      dragMoved = false;
       dragOffset.x = e.global.x - model.x;
       dragOffset.y = e.global.y - model.y;
       setFullInputRegion();
     });
 
-    // Hit areas for animations (gated by tapMotion toggle)
+    // Tap to trigger motions (gated by tapMotion toggle)
+    // Uses pointertap directly — fires on click without drag movement.
     // Tries multiple motion group naming conventions:
     //   Cubism 2: hit area "body" → motion "tap_body"
     //   Cubism 3/4: hit area "TouchBody" → motion "body"
-    model.on('hit', (hitAreaNames) => {
-      if (!tapMotion) return;
+    model.on('pointertap', (e) => {
+      if (!tapMotion || dragMoved) return;
+      const hitAreaNames = model.hitTest(e.global.x, e.global.y);
       for (const name of hitAreaNames) {
         model.motion('tap_' + name);
         model.motion(name);
@@ -289,14 +326,14 @@ async function loadModel(modelPath) {
 
     app.stage.addChild(model);
 
-    // Hit area frames overlay
-    hitAreaFrames = new HitAreaFrames();
-    model.addChild(hitAreaFrames);
-    hitAreaFrames.visible = showHitAreas;
-
-    // Keep border graphics on top
+    // Keep overlays on top
+    app.stage.removeChild(hitAreaGfx);
+    app.stage.addChild(hitAreaGfx);
     app.stage.removeChild(borderGfx);
     app.stage.addChild(borderGfx);
+
+    // Redraw hit areas on each frame (drawables move with animations)
+    app.ticker.add(drawHitAreas);
 
     currentModel = model;
     showBorder = config.show_border;
