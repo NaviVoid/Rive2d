@@ -249,7 +249,7 @@ fn get_config(app: tauri::AppHandle) -> config::AppConfig {
 }
 
 #[tauri::command]
-fn add_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
+async fn add_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
     let p = std::path::Path::new(&path);
     if !p.exists() {
         return Err("File not found".to_string());
@@ -295,34 +295,86 @@ fn extract_lpk(app: &tauri::AppHandle, lpk_path: &str) -> Result<String, String>
 #[derive(serde::Serialize)]
 struct ImportResult {
     imported: u32,
+    skipped: u32,
     errors: Vec<String>,
 }
 
+#[derive(serde::Serialize, Clone)]
+struct ImportProgress {
+    current: u32,
+    total: u32,
+    name: String,
+}
+
 #[tauri::command]
-fn add_models_from_dir(app: tauri::AppHandle, path: String) -> Result<ImportResult, String> {
+async fn add_models_from_dir(app: tauri::AppHandle, path: String) -> Result<ImportResult, String> {
     let dir = std::path::Path::new(&path);
     if !dir.is_dir() {
         return Err("Not a directory".to_string());
     }
 
-    let mut imported = 0u32;
-    let mut errors = Vec::new();
-    walk_for_lpk(dir, 0, 5, &app, &mut imported, &mut errors);
+    // Phase 1: collect all .lpk paths
+    let mut lpk_files = Vec::new();
+    collect_lpk_files(dir, 0, 5, &mut lpk_files);
 
-    if imported == 0 && errors.is_empty() {
+    if lpk_files.is_empty() {
         return Err("No .lpk files found".to_string());
     }
 
-    Ok(ImportResult { imported, errors })
+    let total = lpk_files.len() as u32;
+    let mut imported = 0u32;
+    let mut skipped = 0u32;
+    let mut errors = Vec::new();
+
+    // Phase 2: process with progress events
+    for (i, lpk_path) in lpk_files.iter().enumerate() {
+        let name = lpk_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        app.emit(
+            "import-progress",
+            ImportProgress {
+                current: i as u32 + 1,
+                total,
+                name: name.clone(),
+            },
+        )
+        .ok();
+
+        let path_str = lpk_path.to_string_lossy().to_string();
+        let hash = match file_md5(lpk_path) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        if config::has_hash(&app, &hash) {
+            skipped += 1;
+            continue;
+        }
+        match extract_lpk(&app, &path_str) {
+            Ok(model_path) => {
+                config::add_model(&app, &model_path, Some(&hash));
+                imported += 1;
+            }
+            Err(e) => {
+                errors.push(format!("{}: {}", name, e));
+            }
+        }
+    }
+
+    Ok(ImportResult {
+        imported,
+        skipped,
+        errors,
+    })
 }
 
-fn walk_for_lpk(
+fn collect_lpk_files(
     dir: &std::path::Path,
     depth: u32,
     max_depth: u32,
-    app: &tauri::AppHandle,
-    imported: &mut u32,
-    errors: &mut Vec<String>,
+    out: &mut Vec<std::path::PathBuf>,
 ) {
     if depth > max_depth {
         return;
@@ -333,27 +385,9 @@ fn walk_for_lpk(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            walk_for_lpk(&path, depth + 1, max_depth, app, imported, errors);
+            collect_lpk_files(&path, depth + 1, max_depth, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("lpk") {
-            let path_str = path.to_string_lossy().to_string();
-            let hash = match file_md5(&path) {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-            if config::has_hash(app, &hash) {
-                continue;
-            }
-            match extract_lpk(app, &path_str) {
-                Ok(model_path) => {
-                    config::add_model(app, &model_path, Some(&hash));
-                    *imported += 1;
-                }
-                Err(e) => {
-                    let name = path.file_name().map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or(path_str);
-                    errors.push(format!("{}: {}", name, e));
-                }
-            }
+            out.push(path);
         }
     }
 }

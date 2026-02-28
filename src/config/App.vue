@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 
 const activeTab = ref('models');
@@ -103,6 +104,7 @@ async function refreshConfig() {
 }
 
 const importing = ref(false);
+const importProgress = ref({ current: 0, total: 0, name: '' });
 
 async function importModel() {
   const selected = await open({
@@ -112,9 +114,16 @@ async function importModel() {
       { name: 'Live2D Model JSON', extensions: ['json'] },
     ],
   });
-  if (selected) {
+  if (!selected) return;
+  importing.value = true;
+  importProgress.value = { current: 0, total: 1, name: selected.split('/').pop() };
+  try {
     await invoke('add_model', { path: selected });
     await refreshConfig();
+  } catch (err) {
+    console.error('Import failed:', err);
+  } finally {
+    importing.value = false;
   }
 }
 
@@ -122,6 +131,10 @@ async function importFolder() {
   const selected = await open({ directory: true });
   if (!selected) return;
   importing.value = true;
+  importProgress.value = { current: 0, total: 0, name: 'Scanning...' };
+  const unlisten = await listen('import-progress', (event) => {
+    importProgress.value = event.payload;
+  });
   try {
     const result = await invoke('add_models_from_dir', { path: selected });
     if (result.errors.length > 0) {
@@ -131,6 +144,7 @@ async function importFolder() {
   } catch (err) {
     console.error('Folder import failed:', err);
   } finally {
+    unlisten();
     importing.value = false;
   }
 }
@@ -205,10 +219,20 @@ onMounted(refreshConfig);
         <button class="tab" :class="{ active: activeTab === 'settings' }" @click="activeTab = 'settings'">Settings</button>
       </div>
       <div v-if="activeTab === 'models' && !detailModel" class="import-group">
-        <button class="import-btn" @click="importModel">+ Import</button>
-        <button class="import-btn" @click="importFolder" :disabled="importing">{{ importing ? 'Importing...' : '+ Folder' }}</button>
+        <button class="import-btn" @click="importModel" :disabled="importing">+ Import</button>
+        <button class="import-btn" @click="importFolder" :disabled="importing">+ Folder</button>
       </div>
     </header>
+
+    <div v-if="importing" class="import-progress">
+      <div class="progress-info">
+        <span class="progress-text">{{ importProgress.name }}</span>
+        <span v-if="importProgress.total > 0" class="progress-count">{{ importProgress.current }} / {{ importProgress.total }}</span>
+      </div>
+      <div class="progress-track">
+        <div class="progress-bar" :class="{ indeterminate: importProgress.total <= 1 }" :style="importProgress.total > 1 ? { width: (importProgress.current / importProgress.total * 100) + '%' } : {}"></div>
+      </div>
+    </div>
 
     <template v-if="activeTab === 'models'">
       <!-- Detail/Edit View -->
@@ -391,6 +415,58 @@ button {
 .import-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.import-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.progress-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.progress-text {
+  font-size: 12px;
+  color: #a6adc8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.progress-count {
+  font-size: 12px;
+  color: #6c7086;
+  flex-shrink: 0;
+  margin-left: 8px;
+}
+
+.progress-track {
+  height: 4px;
+  background: #313244;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: #89b4fa;
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+.progress-bar.indeterminate {
+  width: 40% !important;
+  animation: indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
 }
 
 .model-list {
