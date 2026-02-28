@@ -161,6 +161,7 @@ pub fn run() {
             set_model_motions,
             get_model_names,
             get_custom_motions,
+            trigger_motion,
             js_log
         ]);
 
@@ -539,8 +540,16 @@ fn update_input_region(app: tauri::AppHandle, x: i32, y: i32, width: i32, height
 }
 
 #[tauri::command]
-fn open_settings(app: tauri::AppHandle) {
+fn open_settings(app: tauri::AppHandle, view: Option<String>) {
     create_config_window(&app);
+    if let Some(v) = view {
+        // Small delay so the webview has time to mount its listener
+        let handle = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            handle.emit("navigate-settings", v).ok();
+        });
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -676,6 +685,11 @@ fn get_model_names(app: tauri::AppHandle, paths: Vec<String>) -> HashMap<String,
 #[tauri::command]
 fn get_custom_motions(app: tauri::AppHandle, path: String) -> Option<String> {
     config::get_setting(&app, &format!("motions:{}", path))
+}
+
+#[tauri::command]
+fn trigger_motion(app: tauri::AppHandle, group: String, index: Option<u32>) {
+    app.emit("trigger-motion", (group, index)).ok();
 }
 
 #[tauri::command]

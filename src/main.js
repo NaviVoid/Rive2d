@@ -72,6 +72,9 @@ let dragMoved = false;
 let dragStart = { x: 0, y: 0 };
 let dragOffset = { x: 0, y: 0 };
 const DRAG_THRESHOLD = 4; // px — ignore micro-movements for tap detection
+let paramHitItems = [];      // ParamHit controller items parsed from model JSON
+let paramDragging = null;    // { item, startPos, paramIndex, startValue, currentValue }
+let paramReleaseAnims = [];  // parameter reset animations after drag release
 
 // Graphics overlays (drawn on top of model)
 const borderGfx = new PIXI.Graphics();
@@ -99,6 +102,20 @@ const ready = app.init({
   // --- Drag: move & end (on stage to capture events outside model) ---
 
   app.stage.on('pointermove', (e) => {
+    // ParamHit drag — control a Live2D parameter
+    if (paramDragging && currentModel) {
+      if (!dragMoved) {
+        const dx = e.global.x - dragStart.x;
+        const dy = e.global.y - dragStart.y;
+        if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;
+        dragMoved = true;
+      }
+      const { item, startPos, startValue } = paramDragging;
+      const currentPos = item.axis === 0 ? e.global.x : e.global.y;
+      paramDragging.currentValue = startValue + (currentPos - startPos) * item.factor;
+      return;
+    }
+    // Model drag — move position
     if (!dragging || !currentModel) return;
     if (!dragMoved) {
       const dx = e.global.x - dragStart.x;
@@ -112,6 +129,10 @@ const ready = app.init({
   });
 
   app.stage.on('pointerup', () => {
+    if (paramDragging && currentModel) {
+      handleParamHitRelease();
+      return;
+    }
     if (dragging && currentModel) {
       dragging = false;
       savePosition();
@@ -120,6 +141,10 @@ const ready = app.init({
   });
 
   app.stage.on('pointerupoutside', () => {
+    if (paramDragging && currentModel) {
+      handleParamHitRelease();
+      return;
+    }
     if (dragging && currentModel) {
       dragging = false;
       savePosition();
@@ -199,6 +224,13 @@ listen('motions-changed', async (event) => {
   buildHitMotionMap(rawHitAreas, customJsonStr);
 });
 
+listen('trigger-motion', async (event) => {
+  await ready;
+  if (!currentModel) return;
+  const [group, index] = event.payload;
+  currentModel.motion(group, index ?? undefined);
+});
+
 listen('unload-model', async () => {
   await ready;
   if (currentModel) {
@@ -216,6 +248,9 @@ listen('unload-model', async () => {
     motionNameToIndex = {};
     motionNextMap = {};
     pendingNextMtn = null;
+    paramHitItems = [];
+    paramDragging = null;
+    paramReleaseAnims = [];
     // Clear input region so clicks pass through
     invoke('update_input_region', { x: 0, y: 0, width: 0, height: 0 }).catch(() => {});
   }
@@ -320,13 +355,13 @@ function drawHitAreas() {
     const sh = lh * wt.d;
 
     hitAreaGfx.rect(sx, sy, sw, sh);
-    hitAreaGfx.stroke({ width: 2, color: 0xe3a2ff, alpha: 0.8 });
+    hitAreaGfx.stroke({ width: 2, color: 0xff0000, alpha: 0.8 });
 
     // Show name label at top-left of the hit area rect
     if (labelIdx >= hitAreaLabels.length) {
       const label = new PIXI.Text({ text: '', style: {
         fontSize: 12,
-        fill: 0xe3a2ff,
+        fill: 0xff0000,
         fontFamily: 'system-ui, sans-serif',
       }});
       hitAreaLabels.push(label);
@@ -395,8 +430,13 @@ function showContextMenu(x, y) {
   ctxMenu.appendChild(createMenuItem('Reset Position', {
     action: resetModelPosition,
   }));
+  if (currentModelPath) {
+    ctxMenu.appendChild(createMenuItem('Model Settings', {
+      action: () => invoke('open_settings', { view: 'model_detail:' + currentModelPath }),
+    }));
+  }
   ctxMenu.appendChild(createMenuItem('Settings', {
-    action: () => invoke('open_settings'),
+    action: () => invoke('open_settings', { view: null }),
   }));
 
   ctxMenu.style.display = 'block';
@@ -480,12 +520,64 @@ function buildHitMotionMap(rawHitAreas, customJson) {
   if (customJson) Object.assign(hitMotionMap, JSON.parse(customJson));
 }
 
+// Follow Command "start_mtn" redirects to find the actual motion
+function resolveMaxMtn(rawJson, ref, depth = 0) {
+  if (depth > 5) return ref;
+  const resolved = resolveMotionRef(ref);
+  const [group, idxStr] = resolved.split(':');
+  const motions = rawJson.FileReferences?.Motions || rawJson.motions || {};
+  const entries = motions[group];
+  if (!entries) return resolved;
+  const idx = idxStr !== undefined ? parseInt(idxStr) : 0;
+  const entry = entries[idx];
+  if (!entry) return resolved;
+  if (entry.Command && entry.Command.startsWith('start_mtn ')) {
+    return resolveMaxMtn(rawJson, entry.Command.substring('start_mtn '.length).trim(), depth + 1);
+  }
+  return resolved;
+}
+
+function handleParamHitRelease() {
+  const { item, paramIndex, currentValue, startValue } = paramDragging;
+  if (dragMoved) {
+    if (item.maxMtn) {
+      const coreModel = currentModel.internalModel.coreModel;
+      const max = coreModel.getParameterMaximumValue(paramIndex);
+      const min = coreModel.getParameterMinimumValue(paramIndex);
+      const range = max - min;
+      // Check both extremes — factor sign determines drag direction
+      const atMax = currentValue >= max - range * 0.1;
+      const atMin = currentValue <= min + range * 0.1;
+      // Only trigger if the user actually dragged toward that extreme
+      const moved = Math.abs(currentValue - startValue);
+      if (range > 0 && (atMax || atMin) && moved > range * 0.3) {
+        const [group, idxStr] = item.maxMtn.split(':');
+        currentModel.motion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
+      }
+    }
+    if (item.releaseType === 0) {
+      const coreModel = currentModel.internalModel.coreModel;
+      paramReleaseAnims.push({
+        paramIndex,
+        from: currentValue,
+        target: coreModel.getParameterDefaultValue(paramIndex),
+        t: 0,
+      });
+    }
+  }
+  paramDragging = null;
+  updateInputRegion();
+}
+
 // --- Model loading ---
 
 async function loadModel(modelPath) {
   // Reset drag state so stale flags don't block taps on the new model
   dragging = false;
   dragMoved = false;
+  paramDragging = null;
+  paramReleaseAnims = [];
+  paramHitItems = [];
 
   if (currentModel) {
     app.ticker.remove(drawHitAreas);
@@ -549,6 +641,32 @@ async function loadModel(modelPath) {
     // Drag start (left button only, gated by lock model toggle)
     model.on('pointerdown', (e) => {
       if (lockModel || e.button !== 0) return;
+
+      // Check for ParamHit drag areas first
+      if (paramHitItems.length > 0) {
+        const hitNames = model.hitTest(e.global.x, e.global.y);
+        for (const item of paramHitItems) {
+          if (hitNames.includes(item.hitArea)) {
+            const coreModel = model.internalModel.coreModel;
+            const startValue = coreModel.getParameterValueByIndex(item.paramIndex);
+            paramDragging = {
+              item,
+              startPos: item.axis === 0 ? e.global.x : e.global.y,
+              paramIndex: item.paramIndex,
+              startValue,
+              currentValue: startValue,
+            };
+            // Cancel any running release animation for this parameter
+            paramReleaseAnims = paramReleaseAnims.filter(a => a.paramIndex !== item.paramIndex);
+            dragMoved = false;
+            dragStart.x = e.global.x;
+            dragStart.y = e.global.y;
+            setFullInputRegion();
+            return;
+          }
+        }
+      }
+
       dragging = true;
       dragMoved = false;
       dragStart.x = e.global.x;
@@ -572,6 +690,46 @@ async function loadModel(modelPath) {
     } catch {}
     buildHitMotionMap(rawHitAreas, customJsonStr);
     pendingNextMtn = null;
+
+    // Parse ParamHit controller items (drag-to-control-parameter hit areas)
+    const controllers = rawJson.Controllers || rawJson.controllers || {};
+    const paramHitConfig = controllers.ParamHit || controllers.paramHit || {};
+    if (paramHitConfig.Enabled !== false && paramHitConfig.enabled !== false) {
+      const items = paramHitConfig.Items || paramHitConfig.items || [];
+      const coreModel = model.internalModel.coreModel;
+      for (const item of items) {
+        const paramId = item.Id || item.id;
+        const paramIndex = coreModel.getParameterIndex(paramId);
+        if (paramIndex < 0) continue;
+        paramHitItems.push({
+          hitArea: item.HitArea || item.hitArea,
+          paramId,
+          paramIndex,
+          axis: item.Axis ?? 0,
+          factor: item.Factor ?? 0.04,
+          releaseType: item.ReleaseType ?? 0,
+          lockParam: item.LockParam ?? false,
+          maxMtn: item.MaxMtn ? resolveMaxMtn(rawJson, item.MaxMtn) : null,
+        });
+      }
+    }
+
+    // Override motionManager.update to apply paramHit values at the right
+    // point in the update cycle (after motions, before physics/coreModel.update)
+    const origMotionUpdate = model.internalModel.motionManager.update;
+    model.internalModel.motionManager.update = function (...args) {
+      origMotionUpdate.apply(this, args);
+      const cm = model.internalModel.coreModel;
+      if (paramDragging) {
+        cm.setParameterValueByIndex(paramDragging.paramIndex, paramDragging.currentValue);
+      }
+      for (const anim of paramReleaseAnims) {
+        anim.t = Math.min(1, anim.t + 0.05);
+        const v = anim.from + (anim.target - anim.from) * anim.t;
+        cm.setParameterValueByIndex(anim.paramIndex, v);
+      }
+      paramReleaseAnims = paramReleaseAnims.filter(a => a.t < 1);
+    };
 
     // NextMtn chaining: when a motion finishes, play its NextMtn if set
     model.internalModel.motionManager.on('motionFinish', () => {

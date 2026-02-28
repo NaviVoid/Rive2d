@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -59,6 +59,13 @@ async function openDetail(path) {
   } catch (err) {
     console.error('Failed to load model info:', err);
   }
+}
+
+async function triggerMotion(group) {
+  if (!group || group === '__none__') return;
+  // group can be "GroupName" or "GroupName:index"
+  const [g, idx] = group.split(':');
+  await invoke('trigger_motion', { group: g, index: idx !== undefined ? parseInt(idx) : null });
 }
 
 async function saveDetail() {
@@ -214,11 +221,32 @@ async function toggleBorder() {
   });
 }
 
+const sortedModels = computed(() => {
+  const cur = currentModel.value;
+  if (!cur) return models.value;
+  return [...models.value].sort((a, b) => {
+    if (a === cur) return -1;
+    if (b === cur) return 1;
+    return 0;
+  });
+});
+
 function fileName(path) {
   return path.split('/').pop();
 }
 
-onMounted(refreshConfig);
+onMounted(() => {
+  refreshConfig();
+  listen('navigate-settings', async (event) => {
+    const view = event.payload;
+    await refreshConfig();
+    if (view.startsWith('model_detail:')) {
+      const path = view.substring('model_detail:'.length);
+      activeTab.value = 'models';
+      openDetail(path);
+    }
+  });
+});
 </script>
 
 <template>
@@ -270,15 +298,33 @@ onMounted(refreshConfig);
           <div class="motion-table">
             <div v-for="ha in modelInfo.hit_areas" :key="ha.name" class="motion-row">
               <span class="motion-label">{{ ha.name }}</span>
-              <select v-model="editMotions[ha.name]" class="motion-select">
-                <option value="">(default)</option>
-                <option :value="'__none__'">(none)</option>
-                <option
-                  v-for="group in modelInfo.motion_groups"
-                  :key="group"
-                  :value="group"
-                >{{ group }}</option>
-              </select>
+              <div class="motion-controls">
+                <select v-model="editMotions[ha.name]" class="motion-select">
+                  <option value="">(default)</option>
+                  <option :value="'__none__'">(none)</option>
+                  <option
+                    v-for="group in modelInfo.motion_groups"
+                    :key="group"
+                    :value="group"
+                  >{{ group }}</option>
+                </select>
+                <button
+                  class="trigger-btn"
+                  title="Test motion"
+                  @click="triggerMotion(editMotions[ha.name] || ha.default_motion)"
+                  :disabled="editMotions[ha.name] === '__none__' || (!editMotions[ha.name] && !ha.default_motion)"
+                >&#9654;</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="modelInfo && modelInfo.motion_groups.length > 0" class="motions-section">
+          <h3 class="section-title">All Motions</h3>
+          <div class="motion-table">
+            <div v-for="group in modelInfo.motion_groups" :key="group" class="motion-row">
+              <span class="motion-label">{{ group }}</span>
+              <button class="trigger-btn" title="Test motion" @click="triggerMotion(group)">&#9654;</button>
             </div>
           </div>
         </div>
@@ -292,7 +338,7 @@ onMounted(refreshConfig);
       <!-- Model List -->
       <section class="model-list" v-else-if="models.length > 0">
         <div
-          v-for="model in models"
+          v-for="model in sortedModels"
           :key="model"
           class="model-card"
           :class="{ active: model === currentModel }"
@@ -535,6 +581,7 @@ button {
 
 .model-card.active {
   border-color: #89b4fa;
+  background: #1e3a5f;
 }
 
 .model-info {
@@ -781,6 +828,31 @@ button {
 
 .motion-select:focus {
   border-color: #89b4fa;
+}
+
+.motion-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.trigger-btn {
+  padding: 4px 8px;
+  background: #45475a;
+  color: #a6adc8;
+  font-size: 11px;
+  line-height: 1;
+  min-width: 28px;
+}
+
+.trigger-btn:hover:not(:disabled) {
+  background: #585b70;
+  color: #89b4fa;
+}
+
+.trigger-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
 }
 
 .detail-actions {
