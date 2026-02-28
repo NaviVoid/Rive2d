@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 
+const activeTab = ref('models');
 const models = ref([]);
 const currentModel = ref(null);
 const showBorder = ref(false);
@@ -87,45 +88,50 @@ onMounted(refreshConfig);
 <template>
   <div class="container">
     <header>
-      <h1>Rive2d Settings</h1>
-      <button class="import-btn" @click="importModel">+ Import</button>
+      <div class="tab-bar">
+        <button class="tab" :class="{ active: activeTab === 'models' }" @click="activeTab = 'models'">Models</button>
+        <button class="tab" :class="{ active: activeTab === 'settings' }" @click="activeTab = 'settings'">Settings</button>
+      </div>
+      <button v-if="activeTab === 'models'" class="import-btn" @click="importModel">+ Import</button>
     </header>
 
-    <section class="model-list" v-if="models.length > 0">
-      <div
-        v-for="model in models"
-        :key="model"
-        class="model-card"
-        :class="{ active: model === currentModel }"
-      >
-        <div class="model-preview" @click="uploadPreview(model)" title="Click to set preview image">
-          <img v-if="previews[model]" :src="previews[model]" alt="preview" />
-          <div v-else class="no-preview">+</div>
+    <template v-if="activeTab === 'models'">
+      <section class="model-list" v-if="models.length > 0">
+        <div
+          v-for="model in models"
+          :key="model"
+          class="model-card"
+          :class="{ active: model === currentModel }"
+        >
+          <div class="model-preview" @click="uploadPreview(model)" title="Click to set preview image">
+            <img v-if="previews[model]" :src="previews[model]" alt="preview" />
+            <div v-else class="no-preview">+</div>
+          </div>
+          <div class="model-info">
+            <span class="model-name">{{ fileName(model) }}</span>
+          </div>
+          <div class="model-actions">
+            <span v-if="model === currentModel" class="badge">Active</span>
+            <button v-else class="load-btn" @click="loadModel(model)">Load</button>
+            <button class="remove-btn" @click="removeModel(model)">Remove</button>
+          </div>
         </div>
-        <div class="model-info">
-          <span class="model-name">{{ fileName(model) }}</span>
-        </div>
-        <div class="model-actions">
-          <span v-if="model === currentModel" class="badge">Active</span>
-          <button v-else class="load-btn" @click="loadModel(model)">Load</button>
-          <button class="remove-btn" @click="removeModel(model)">Remove</button>
-        </div>
-      </div>
-    </section>
+      </section>
 
-    <section class="empty-state" v-else>
-      <p>No models imported yet.</p>
-      <p class="hint">Click "+ Import" to add a Live2D model.</p>
-    </section>
+      <section class="empty-state" v-else>
+        <p>No models imported yet.</p>
+        <p class="hint">Click "+ Import" to add a Live2D model.</p>
+      </section>
+    </template>
 
-    <footer>
+    <section v-if="activeTab === 'settings'" class="settings-panel">
       <div class="setting-row" @click="toggleBorder">
         <span class="setting-label">Show debug border</span>
         <div class="toggle" :class="{ on: showBorder }">
           <div class="toggle-knob" />
         </div>
       </div>
-    </footer>
+    </section>
   </div>
 </template>
 
@@ -155,9 +161,29 @@ header {
   align-items: center;
 }
 
-h1 {
-  font-size: 20px;
-  font-weight: 600;
+.tab-bar {
+  display: flex;
+  gap: 4px;
+}
+
+.tab {
+  padding: 8px 16px;
+  background: transparent;
+  color: #6c7086;
+  font-size: 14px;
+  font-weight: 500;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  transition: color 0.2s, border-color 0.2s;
+}
+
+.tab:hover {
+  color: #a6adc8;
+}
+
+.tab.active {
+  color: #89b4fa;
+  border-bottom-color: #89b4fa;
 }
 
 button {
@@ -304,9 +330,8 @@ button {
   color: #585b70;
 }
 
-footer {
-  border-top: 1px solid #313244;
-  padding-top: 16px;
+.settings-panel {
+  flex: 1;
 }
 
 .setting-row {
