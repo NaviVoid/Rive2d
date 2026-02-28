@@ -261,7 +261,7 @@ Drag-to-parameter mapping: dragging on a hit area changes a Live2D parameter val
         "HitArea": "TouchDrag1", // which hit area triggers this
         "Axis": 0, // 0 = horizontal, 1 = vertical
         "Factor": -0.03, // drag sensitivity (negative = inverted)
-        "ReleaseType": 0, // 0 = stay at value, 2 = spring back
+        "ReleaseType": 0, // 0 = spring back, 1 = spring back (timed), 2 = stay, 3 = sticky/persistent
         "Release": 100, // spring-back duration (ms)
         "LockParam": false, // lock parameter during drag
         "MaxMtn": "扯内裤", // motion when param reaches max
@@ -283,7 +283,7 @@ Drag-to-parameter mapping: dragging on a hit area changes a Live2D parameter val
 | `HitArea`     | string | Hit area Name that activates this drag                                                              |
 | `Axis`        | int    | `0` = horizontal (X), `1` = vertical (Y)                                                            |
 | `Factor`      | float  | Pixels-to-parameter sensitivity. Negative inverts direction                                         |
-| `ReleaseType` | int    | `0` = parameter stays at dragged value, `2` = springs back to default                               |
+| `ReleaseType` | int    | `0` = spring back to default, `1` = spring back (timed), `2` = stay at value, `3` = sticky/persistent |
 | `Release`     | int    | Spring-back animation duration in ms                                                                |
 | `LockParam`   | bool   | Lock the parameter (prevent other controllers from changing it) during drag                         |
 | `MaxMtn`      | string | Motion triggered when parameter reaches its maximum value                                           |
@@ -306,11 +306,13 @@ Automatic looping parameter animations (e.g., swaying, floating effects).
 }
 ```
 
-| Field      | Type  | Description                          |
-| ---------- | ----- | ------------------------------------ |
-| `Ids`      | array | Parameter IDs to animate             |
-| `Type`     | int   | Waveform: `0` = sine, `1` = triangle |
-| `Duration` | int   | Loop period in ms                    |
+| Field       | Type  | Description                                         |
+| ----------- | ----- | --------------------------------------------------- |
+| `Id`        | string | Single parameter ID (legacy format)                |
+| `Ids`       | array | Parameter IDs to animate                            |
+| `Type`      | int   | Waveform: `0` = sine, `1` = triangle/sawtooth       |
+| `Duration`  | int   | Loop period in ms                                   |
+| `BlendMode` | int   | `0` = overwrite parameter, `1` = additive blending  |
 
 ### KeyTrigger
 
