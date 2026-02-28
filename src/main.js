@@ -1,4 +1,5 @@
 import * as PIXI from 'pixi.js';
+import { Assets } from 'pixi.js';
 import { Live2DModel } from 'untitled-pixi-live2d-engine';
 
 // Expose PIXI globally for pixi-live2d-display
@@ -6,6 +7,22 @@ window.PIXI = PIXI;
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
+
+// Forward console logs to backend log file
+for (const level of ['log', 'warn', 'error']) {
+  const orig = console[level];
+  console[level] = (...args) => {
+    orig.apply(console, args);
+    const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+    invoke('js_log', { level, msg }).catch(() => {});
+  };
+}
+window.addEventListener('error', (e) => {
+  invoke('js_log', { level: 'error', msg: `${e.message} at ${e.filename}:${e.lineno}:${e.colno}` }).catch(() => {});
+});
+window.addEventListener('unhandledrejection', (e) => {
+  invoke('js_log', { level: 'error', msg: `Unhandled rejection: ${e.reason}` }).catch(() => {});
+});
 
 // Disable PixiJS Worker texture loading — Workers have their own fetch() that
 // can't access Tauri's model:// custom protocol.  Keep createImageBitmap enabled
@@ -46,7 +63,9 @@ let showHitAreas = false;
 let lockModel = false;
 let dragging = false;
 let dragMoved = false;
+let dragStart = { x: 0, y: 0 };
 let dragOffset = { x: 0, y: 0 };
+const DRAG_THRESHOLD = 4; // px — ignore micro-movements for tap detection
 
 // Graphics overlays (drawn on top of model)
 const borderGfx = new PIXI.Graphics();
@@ -72,7 +91,12 @@ const ready = app.init({
 
   app.stage.on('pointermove', (e) => {
     if (!dragging || !currentModel) return;
-    dragMoved = true;
+    if (!dragMoved) {
+      const dx = e.global.x - dragStart.x;
+      const dy = e.global.y - dragStart.y;
+      if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;
+      dragMoved = true;
+    }
     currentModel.x = e.global.x - dragOffset.x;
     currentModel.y = e.global.y - dragOffset.y;
     updateBorder();
@@ -92,6 +116,22 @@ const ready = app.init({
       savePosition();
       updateInputRegion();
     }
+  });
+
+  // --- Right-click debug menu ---
+  app.canvas.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    showContextMenu(e.clientX, e.clientY);
+  });
+
+  // Close menu on left-click outside or Escape
+  document.addEventListener('pointerdown', (e) => {
+    if (ctxMenu.style.display !== 'none' && !ctxMenu.contains(e.target)) {
+      closeContextMenu();
+    }
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeContextMenu();
   });
 
   // --- Scroll wheel resize ---
@@ -134,17 +174,7 @@ listen('load-model', async (event) => {
 
 listen('reset-position', async () => {
   await ready;
-  if (!currentModel) return;
-  // Get unscaled dimensions (width/height are affected by current scale)
-  const origW = currentModel.width / currentModel.scale.x;
-  const origH = currentModel.height / currentModel.scale.y;
-  const scaleX = app.screen.width / origW;
-  const scaleY = app.screen.height / origH;
-  currentModel.scale.set(Math.min(scaleX, scaleY) * 0.3);
-  currentModel.x = app.screen.width / 2;
-  currentModel.y = app.screen.height / 2;
-  updateBorder();
-  updateInputRegion();
+  resetModelPosition();
 });
 
 listen('setting-changed', (event) => {
@@ -237,6 +267,88 @@ function drawHitAreas() {
   }
 }
 
+// --- Right-click context menu ---
+
+const ctxMenu = document.createElement('div');
+ctxMenu.className = 'ctx-menu';
+document.body.appendChild(ctxMenu);
+
+function createMenuItem(label, opts = {}) {
+  const el = document.createElement('div');
+  el.className = 'ctx-item';
+  if (opts.toggle !== undefined) {
+    const check = document.createElement('span');
+    check.className = 'ctx-check';
+    check.textContent = opts.toggle ? '\u2713' : '';
+    el.appendChild(check);
+  }
+  const text = document.createElement('span');
+  text.textContent = label;
+  el.appendChild(text);
+  el.addEventListener('click', () => { opts.action(); closeContextMenu(); });
+  return el;
+}
+
+function createSeparator() {
+  const el = document.createElement('div');
+  el.className = 'ctx-sep';
+  return el;
+}
+
+function showContextMenu(x, y) {
+  ctxMenu.innerHTML = '';
+  ctxMenu.appendChild(createMenuItem('Tap Motions', {
+    toggle: tapMotion,
+    action: () => invoke('set_setting', { key: 'tap_motion', value: String(!tapMotion) }),
+  }));
+  ctxMenu.appendChild(createMenuItem('Show Hit Areas', {
+    toggle: showHitAreas,
+    action: () => invoke('set_setting', { key: 'show_hit_areas', value: String(!showHitAreas) }),
+  }));
+  ctxMenu.appendChild(createMenuItem('Lock Model', {
+    toggle: lockModel,
+    action: () => invoke('set_setting', { key: 'lock_model', value: String(!lockModel) }),
+  }));
+  ctxMenu.appendChild(createMenuItem('Debug Border', {
+    toggle: showBorder,
+    action: () => invoke('set_setting', { key: 'show_border', value: String(!showBorder) }),
+  }));
+  ctxMenu.appendChild(createSeparator());
+  ctxMenu.appendChild(createMenuItem('Reset Position', {
+    action: resetModelPosition,
+  }));
+  ctxMenu.appendChild(createMenuItem('Settings', {
+    action: () => invoke('open_settings'),
+  }));
+
+  ctxMenu.style.display = 'block';
+  // Clamp to window bounds
+  const menuW = ctxMenu.offsetWidth;
+  const menuH = ctxMenu.offsetHeight;
+  ctxMenu.style.left = Math.min(x, window.innerWidth - menuW) + 'px';
+  ctxMenu.style.top = Math.min(y, window.innerHeight - menuH) + 'px';
+  setFullInputRegion();
+}
+
+function closeContextMenu() {
+  if (ctxMenu.style.display === 'none') return;
+  ctxMenu.style.display = 'none';
+  updateInputRegion();
+}
+
+function resetModelPosition() {
+  if (!currentModel) return;
+  const origW = currentModel.width / currentModel.scale.x;
+  const origH = currentModel.height / currentModel.scale.y;
+  const scaleX = app.screen.width / origW;
+  const scaleY = app.screen.height / origH;
+  currentModel.scale.set(Math.min(scaleX, scaleY) * 0.3);
+  currentModel.x = app.screen.width / 2;
+  currentModel.y = app.screen.height / 2;
+  updateBorder();
+  updateInputRegion();
+}
+
 // --- Save helpers ---
 
 let scaleSaveTimeout = null;
@@ -256,10 +368,20 @@ function savePosition() {
 // --- Model loading ---
 
 async function loadModel(modelPath) {
+  // Reset drag state so stale flags don't block taps on the new model
+  dragging = false;
+  dragMoved = false;
+
   if (currentModel) {
     app.ticker.remove(drawHitAreas);
     hitAreaGfx.clear();
     app.stage.removeChild(currentModel);
+    // Evict textures from PixiJS asset cache before destroying, otherwise
+    // Assets.load() returns stale destroyed textures for the same URLs.
+    const modelKeys = [...Assets.cache._cache.keys()].filter(k => k.startsWith('model://'));
+    for (const key of modelKeys) {
+      Assets.cache.remove(key);
+    }
     currentModel.destroy();
     currentModel = null;
   }
@@ -269,6 +391,18 @@ async function loadModel(modelPath) {
       autoHitTest: false,
       autoFocus: true,
     });
+
+    // Guard against textures with destroyed/missing source — the library
+    // accesses texture.source._gpuData without null-checking, which crashes
+    // if a texture source was garbage-collected or never fully loaded.
+    model.textures = model.textures.filter(t => t?.source);
+    const origRender = model.renderLive2D;
+    model.renderLive2D = (renderer) => {
+      for (const tex of model.textures) {
+        if (!tex?.source) return;
+      }
+      origRender(renderer);
+    };
 
     // Load saved position/scale from config
     const config = await invoke('get_config');
@@ -296,11 +430,13 @@ async function loadModel(modelPath) {
     model.eventMode = 'static';
     model.cursor = 'pointer';
 
-    // Drag start (gated by lock model toggle)
+    // Drag start (left button only, gated by lock model toggle)
     model.on('pointerdown', (e) => {
-      if (lockModel) return;
+      if (lockModel || e.button !== 0) return;
       dragging = true;
       dragMoved = false;
+      dragStart.x = e.global.x;
+      dragStart.y = e.global.y;
       dragOffset.x = e.global.x - model.x;
       dragOffset.y = e.global.y - model.y;
       setFullInputRegion();

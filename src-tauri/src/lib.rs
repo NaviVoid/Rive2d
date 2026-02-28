@@ -44,14 +44,36 @@ pub fn run() {
                         _ => "application/octet-stream",
                     };
 
-                    // Patch model3.json: add missing "Groups" field required by Cubism SDK
+                    // Patch model3.json
                     if path.ends_with(".model3.json") {
                         if let Ok(text) = std::str::from_utf8(&data) {
                             if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text) {
+                                let mut patched_any = false;
+
+                                // Add missing "Groups" field required by Cubism SDK
                                 if json.get("FileReferences").is_some() && json.get("Groups").is_none() {
                                     json["Groups"] = serde_json::json!([]);
-                                    if let Ok(patched) = serde_json::to_vec(&json) {
-                                        data = patched;
+                                    patched_any = true;
+                                }
+
+                                // Remove empty texture entries — LPK extraction can leave
+                                // empty strings which cause Assets.load("") to return a
+                                // plain object instead of a Texture, crashing the renderer.
+                                if let Some(textures) = json.pointer_mut("/FileReferences/Textures")
+                                    .and_then(|v| v.as_array_mut())
+                                {
+                                    let before = textures.len();
+                                    textures.retain(|v| {
+                                        v.as_str().map_or(true, |s| !s.is_empty())
+                                    });
+                                    if textures.len() != before {
+                                        patched_any = true;
+                                    }
+                                }
+
+                                if patched_any {
+                                    if let Ok(out) = serde_json::to_vec(&json) {
+                                        data = out;
                                     }
                                 }
                             }
@@ -131,6 +153,7 @@ pub fn run() {
             remove_model,
             set_setting,
             update_input_region,
+            open_settings,
             js_log
         ]);
 
@@ -262,6 +285,9 @@ fn remove_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
 async fn apply_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
     config::set_model(&app, &path);
 
+    // Clear old model's position/scale so new model starts centered
+    config::delete_settings(&app, &["model_x", "model_y", "model_scale"]);
+
     // Initialize layer shell if not yet done
     let needs_init = {
         let state = app.state::<Mutex<PetWindowState>>();
@@ -386,6 +412,24 @@ fn update_input_region(app: tauri::AppHandle, x: i32, y: i32, width: i32, height
 }
 
 #[tauri::command]
-fn js_log(msg: String) {
-    eprintln!("[rive2d:js] {}", msg);
+fn open_settings(app: tauri::AppHandle) {
+    create_config_window(&app);
+}
+
+#[tauri::command]
+fn js_log(level: String, msg: String) {
+    eprintln!("[rive2d:js:{}] {}", level, msg);
+    use std::io::Write;
+    // Tauri dev runs from src-tauri/, go up one level to project root
+    let log_path = std::env::current_dir()
+        .unwrap_or_default()
+        .join("../rive2d.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        writeln!(f, "[{}] [{}] {}", now, level, msg).ok();
+    }
 }
