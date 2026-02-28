@@ -58,6 +58,53 @@ pub fn run() {
                         }
                     }
 
+                    // Patch motion3.json: fix incorrect TotalPointCount/TotalSegmentCount
+                    // LPK-extracted motions have hashed filenames (.json, not .motion3.json),
+                    // so detect by content structure rather than extension.
+                    if mime == "application/json" {
+                        if let Ok(text) = std::str::from_utf8(&data) {
+                            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text) {
+                                if json.get("Meta").and_then(|m| m.get("TotalPointCount")).is_some()
+                                    && json.get("Curves").and_then(|c| c.as_array()).is_some()
+                                {
+                                    let curves = json["Curves"].as_array().unwrap();
+                                    let mut total_points: u64 = 0;
+                                    let mut total_segments: u64 = 0;
+
+                                    for curve in curves {
+                                        if let Some(segs) = curve.get("Segments").and_then(|s| s.as_array()) {
+                                            if segs.len() < 2 { continue; }
+                                            total_points += 1; // initial point (time, value)
+                                            let mut i = 2;
+                                            while i < segs.len() {
+                                                let seg_type = segs[i].as_f64().unwrap_or(-1.0) as i64;
+                                                match seg_type {
+                                                    0 | 2 | 3 => { // Linear / Stepped / InvStepped
+                                                        total_points += 1;
+                                                        total_segments += 1;
+                                                        i += 3;
+                                                    }
+                                                    1 => { // Bezier
+                                                        total_points += 3;
+                                                        total_segments += 1;
+                                                        i += 7;
+                                                    }
+                                                    _ => break,
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    json["Meta"]["TotalPointCount"] = serde_json::json!(total_points);
+                                    json["Meta"]["TotalSegmentCount"] = serde_json::json!(total_segments);
+                                    if let Ok(patched) = serde_json::to_vec(&json) {
+                                        data = patched;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     tauri::http::Response::builder()
                         .header("Content-Type", mime)
                         .header("Access-Control-Allow-Origin", "*")
