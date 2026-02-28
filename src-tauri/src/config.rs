@@ -11,6 +11,9 @@ pub struct AppConfig {
     pub model_x: Option<f64>,
     pub model_y: Option<f64>,
     pub model_scale: Option<f64>,
+    pub tap_motion: bool,
+    pub show_hit_areas: bool,
+    pub lock_model: bool,
 }
 
 fn db_path(app: &tauri::AppHandle) -> PathBuf {
@@ -96,6 +99,33 @@ pub fn load(app: &tauri::AppHandle) -> AppConfig {
         .ok()
         .and_then(|v| v.parse().ok());
 
+    let tap_motion: bool = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'tap_motion'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|v| v == "true")
+        .unwrap_or(true);
+
+    let show_hit_areas: bool = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'show_hit_areas'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    let lock_model: bool = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'lock_model'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     AppConfig {
         current_model,
         models,
@@ -103,6 +133,9 @@ pub fn load(app: &tauri::AppHandle) -> AppConfig {
         model_x,
         model_y,
         model_scale,
+        tap_motion,
+        show_hit_areas,
+        lock_model,
     }
 }
 

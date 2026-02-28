@@ -1,5 +1,6 @@
 import * as PIXI from 'pixi.js';
 import { Live2DModel } from 'untitled-pixi-live2d-engine';
+import { HitAreaFrames } from 'untitled-pixi-live2d-engine/extra';
 
 // Expose PIXI globally for pixi-live2d-display
 window.PIXI = PIXI;
@@ -40,7 +41,11 @@ const canvas = document.getElementById('canvas');
 const app = new PIXI.Application();
 
 let currentModel = null;
+let hitAreaFrames = null;
 let showBorder = false;
+let tapMotion = true;
+let showHitAreas = false;
+let lockModel = false;
 let dragging = false;
 let dragOffset = { x: 0, y: 0 };
 
@@ -90,7 +95,7 @@ const ready = app.init({
   // --- Scroll wheel resize ---
 
   app.canvas.addEventListener('wheel', (e) => {
-    if (!currentModel) return;
+    if (!currentModel || lockModel) return;
     e.preventDefault();
     const factor = e.deltaY > 0 ? 0.95 : 1.05;
     const newScale = Math.max(0.05, Math.min(2.0, currentModel.scale.x * factor));
@@ -114,6 +119,9 @@ const ready = app.init({
 
 invoke('get_config').then((config) => {
   showBorder = config.show_border;
+  tapMotion = config.tap_motion;
+  showHitAreas = config.show_hit_areas;
+  lockModel = config.lock_model;
 }).catch(() => {});
 
 listen('load-model', async (event) => {
@@ -142,6 +150,16 @@ listen('setting-changed', (event) => {
   if (key === 'show_border') {
     showBorder = value === 'true';
     updateBorder();
+  }
+  if (key === 'tap_motion') {
+    tapMotion = value === 'true';
+  }
+  if (key === 'show_hit_areas') {
+    showHitAreas = value === 'true';
+    updateHitAreaFrames();
+  }
+  if (key === 'lock_model') {
+    lockModel = value === 'true';
   }
 });
 
@@ -178,6 +196,14 @@ function updateBorder() {
   borderGfx.stroke({ width: 2, color: 0xff0000, alpha: 1 });
 }
 
+// --- Hit area frames ---
+
+function updateHitAreaFrames() {
+  if (hitAreaFrames) {
+    hitAreaFrames.visible = showHitAreas;
+  }
+}
+
 // --- Save helpers ---
 
 let scaleSaveTimeout = null;
@@ -201,6 +227,7 @@ async function loadModel(modelPath) {
     app.stage.removeChild(currentModel);
     currentModel.destroy();
     currentModel = null;
+    hitAreaFrames = null;
   }
 
   try {
@@ -235,25 +262,37 @@ async function loadModel(modelPath) {
     model.eventMode = 'static';
     model.cursor = 'pointer';
 
-    // Drag start
+    // Drag start (gated by lock model toggle)
     model.on('pointerdown', (e) => {
+      if (lockModel) return;
       dragging = true;
       dragOffset.x = e.global.x - model.x;
       dragOffset.y = e.global.y - model.y;
       setFullInputRegion();
     });
 
-    // Hit areas for animations
+    // Hit areas for animations (gated by tapMotion toggle)
+    // Tries multiple motion group naming conventions:
+    //   Cubism 2: hit area "body" → motion "tap_body"
+    //   Cubism 3/4: hit area "TouchBody" → motion "body"
     model.on('hit', (hitAreaNames) => {
-      if (hitAreaNames.includes('Body') || hitAreaNames.includes('body')) {
-        model.motion('tap_body');
-      }
-      if (hitAreaNames.includes('Head') || hitAreaNames.includes('head')) {
-        model.expression();
+      if (!tapMotion) return;
+      for (const name of hitAreaNames) {
+        model.motion('tap_' + name);
+        model.motion(name);
+        const stripped = name.replace(/^Touch/i, '');
+        if (stripped !== name) {
+          model.motion(stripped.toLowerCase());
+        }
       }
     });
 
     app.stage.addChild(model);
+
+    // Hit area frames overlay
+    hitAreaFrames = new HitAreaFrames();
+    model.addChild(hitAreaFrames);
+    hitAreaFrames.visible = showHitAreas;
 
     // Keep border graphics on top
     app.stage.removeChild(borderGfx);
@@ -261,6 +300,8 @@ async function loadModel(modelPath) {
 
     currentModel = model;
     showBorder = config.show_border;
+    showHitAreas = config.show_hit_areas;
+    lockModel = config.lock_model;
 
     updateBorder();
     updateInputRegion();

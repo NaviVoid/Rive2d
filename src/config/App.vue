@@ -7,6 +7,9 @@ const activeTab = ref('models');
 const models = ref([]);
 const currentModel = ref(null);
 const showBorder = ref(false);
+const tapMotion = ref(true);
+const showHitAreas = ref(false);
+const lockModel = ref(false);
 const previews = ref({});
 
 async function loadPreviews(modelPaths) {
@@ -27,6 +30,9 @@ async function refreshConfig() {
     models.value = config.models;
     currentModel.value = config.current_model;
     showBorder.value = config.show_border;
+    tapMotion.value = config.tap_motion;
+    showHitAreas.value = config.show_hit_areas;
+    lockModel.value = config.lock_model;
     loadPreviews(config.models);
   } catch (err) {
     console.error('Failed to load config:', err);
@@ -68,6 +74,30 @@ async function uploadPreview(modelPath) {
     await invoke('set_model_preview', { modelPath, imagePath: selected });
     previews.value[modelPath] = 'model://localhost/' + selected;
   }
+}
+
+async function toggleTapMotion() {
+  tapMotion.value = !tapMotion.value;
+  await invoke('set_setting', {
+    key: 'tap_motion',
+    value: tapMotion.value ? 'true' : 'false',
+  });
+}
+
+async function toggleHitAreas() {
+  showHitAreas.value = !showHitAreas.value;
+  await invoke('set_setting', {
+    key: 'show_hit_areas',
+    value: showHitAreas.value ? 'true' : 'false',
+  });
+}
+
+async function toggleLockPosition() {
+  lockModel.value = !lockModel.value;
+  await invoke('set_setting', {
+    key: 'lock_model',
+    value: lockModel.value ? 'true' : 'false',
+  });
 }
 
 async function toggleBorder() {
@@ -125,6 +155,24 @@ onMounted(refreshConfig);
     </template>
 
     <section v-if="activeTab === 'settings'" class="settings-panel">
+      <div class="setting-row" @click="toggleTapMotion">
+        <span class="setting-label">Enable tap motions</span>
+        <div class="toggle" :class="{ on: tapMotion }">
+          <div class="toggle-knob" />
+        </div>
+      </div>
+      <div class="setting-row" @click="toggleHitAreas">
+        <span class="setting-label">Show hit areas</span>
+        <div class="toggle" :class="{ on: showHitAreas }">
+          <div class="toggle-knob" />
+        </div>
+      </div>
+      <div class="setting-row" @click="toggleLockPosition">
+        <span class="setting-label">Lock model</span>
+        <div class="toggle" :class="{ on: lockModel }">
+          <div class="toggle-knob" />
+        </div>
+      </div>
       <div class="setting-row" @click="toggleBorder">
         <span class="setting-label">Show debug border</span>
         <div class="toggle" :class="{ on: showBorder }">
@@ -375,4 +423,5 @@ button {
 .toggle.on .toggle-knob {
   transform: translateX(16px);
 }
+
 </style>
