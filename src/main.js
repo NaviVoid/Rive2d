@@ -86,12 +86,48 @@ let hitAreaOrder = {};       // { hitAreaName: orderValue } from HitAreas[].Orde
 let dragScrubState = null;   // { motion, entry, duration, progress, hitArea } — drag motion scrubbing
 const DRAG_SCRUB_DISTANCE = 200; // pixels of drag for full animation progress (0→1)
 
+// --- Feature state ---
+let motionEntryMap = {};       // { group: { index: entryObject } }
+let varStore = {};             // VarFloats variable store
+let lockedParams = {};         // { paramId: { paramIndex, value, startTime, duration } }
+let lockedParts = {};          // { partId: { index, value } }
+let disabledMotionGroups = new Set();
+let disabledParamHitItems = new Set();
+let intimacyValue = 50;
+let intimacyConfig = null;     // { initValue, minValue, maxValue }
+let currentMotionInfo = null;  // { group, index, entry }
+let playedMotions = new Set(); // for PreMtn tracking
+let leaveGroups = [];          // { group, interval, minDuration, maxDuration }
+let lastInteractionTime = 0;
+let leaveTimeout = null;
+let leaveActive = false;
+let keyTriggerItems = [];      // { keyCode, downMtn }
+let paramTriggerItems = [];    // { paramId, paramIndex, triggers[] }
+let paramTriggerLastValues = {};
+let speechBubbleTimeout = null;
+let extraMotionEnabled = false;
+let eyeBlinkSave = null;       // saved eyeBlink reference for enable/disable
+let physicsSave = null;        // saved physics reference for enable/disable
+let soundMuted = false;
+
 // Graphics overlays (drawn on top of model)
 const borderGfx = new PIXI.Graphics();
 const hitAreaGfx = new PIXI.Graphics();
 const hitAreaContainer = new PIXI.Container();
 hitAreaContainer.addChild(hitAreaGfx);
 const hitAreaLabels = []; // pool of PIXI.Text for hit area names
+
+// Speech bubble element
+const speechBubble = document.createElement('div');
+speechBubble.className = 'speech-bubble';
+speechBubble.style.display = 'none';
+document.body.appendChild(speechBubble);
+
+// Choices UI element
+const choicesContainer = document.createElement('div');
+choicesContainer.className = 'choices-menu';
+choicesContainer.style.display = 'none';
+document.body.appendChild(choicesContainer);
 
 // init() is async; listeners registered before it so events aren't missed
 const ready = app.init({
@@ -211,9 +247,21 @@ const ready = app.init({
     if (ctxMenu.style.display !== 'none' && !ctxMenu.contains(e.target)) {
       closeContextMenu();
     }
+    // Reset interaction time for Leave timer
+    lastInteractionTime = Date.now();
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') closeContextMenu();
+    // KeyTrigger: dispatch key press to motion
+    for (const kt of keyTriggerItems) {
+      if (e.keyCode === kt.keyCode && kt.downMtn) {
+        const [g, idxStr] = kt.downMtn.split(':');
+        console.log(`[key] KeyTrigger ${e.keyCode} → ${kt.downMtn}`);
+        playMotion(g, idxStr !== undefined ? parseInt(idxStr) : undefined);
+        break;
+      }
+    }
+    lastInteractionTime = Date.now();
   });
 
   // --- Scroll wheel resize ---
@@ -277,7 +325,7 @@ listen('trigger-motion', async (event) => {
   if (!currentModel) return;
   const [group, index] = event.payload;
   console.log(`[motion] trigger from settings: ${group}` + (index != null ? `:${index}` : ''));
-  currentModel.motion(group, index ?? undefined);
+  playMotion(group, index ?? undefined);
 });
 
 listen('unload-model', async () => {
@@ -309,6 +357,30 @@ listen('unload-model', async () => {
     dragMotionTriggered = false;
     modelMotions = {};
     hitAreaOrder = {};
+    // Reset feature state
+    motionEntryMap = {};
+    varStore = {};
+    lockedParams = {};
+    lockedParts = {};
+    disabledMotionGroups = new Set();
+    disabledParamHitItems = new Set();
+    currentMotionInfo = null;
+    playedMotions = new Set();
+    leaveGroups = [];
+    if (leaveTimeout) { clearInterval(leaveTimeout); leaveTimeout = null; }
+    leaveActive = false;
+    keyTriggerItems = [];
+    paramTriggerItems = [];
+    paramTriggerLastValues = {};
+    clearTimeout(speechBubbleTimeout);
+    speechBubble.style.display = 'none';
+    choicesContainer.style.display = 'none';
+    extraMotionEnabled = false;
+    eyeBlinkSave = null;
+    physicsSave = null;
+    soundMuted = false;
+    intimacyConfig = null;
+    intimacyValue = 50;
     // Clear input region so clicks pass through
     invoke('update_input_region', { x: 0, y: 0, width: 0, height: 0 }).catch(() => {});
   }
@@ -543,17 +615,20 @@ function savePosition() {
 
 // --- Motion map helpers ---
 
-// Build motionNameToIndex and motionNextMap from raw model JSON
+// Build motionNameToIndex, motionNextMap, fileLoopMap, and motionEntryMap from raw model JSON
 function buildMotionMaps(rawJson) {
   const motions = rawJson.FileReferences?.Motions || rawJson.motions || {};
   motionNameToIndex = {};
   motionNextMap = {};
   fileLoopMap = {};
+  motionEntryMap = {};
   for (const [group, entries] of Object.entries(motions)) {
     if (!Array.isArray(entries)) continue;
     motionNameToIndex[group] = {};
     motionNextMap[group] = {};
+    motionEntryMap[group] = {};
     for (let i = 0; i < entries.length; i++) {
+      motionEntryMap[group][i] = entries[i];
       if (entries[i].Name) motionNameToIndex[group][entries[i].Name] = i;
       if (entries[i].NextMtn) motionNextMap[group][i] = entries[i].NextMtn;
       if (entries[i].FileLoop || entries[i].WrapMode === 1) {
@@ -648,6 +723,422 @@ function resolveMaxMtn(rawJson, ref, depth = 0) {
   }
   return resolved;
 }
+
+// --- Central motion gateway ---
+
+function playMotion(group, index, priority) {
+  if (!currentModel) return;
+  if (disabledMotionGroups.has(group)) {
+    console.log(`[motion] playMotion ${group} — skipped (group disabled)`);
+    return;
+  }
+  if (index === undefined) {
+    index = selectMotionIndex(group);
+    if (index === undefined) {
+      console.log(`[motion] playMotion ${group} — no eligible motion found`);
+      return;
+    }
+  } else if (!isMotionEligible(group, index, motionEntryMap[group]?.[index])) {
+    console.log(`[motion] playMotion ${group}:${index} — not eligible`);
+    return;
+  }
+  const entry = motionEntryMap[group]?.[index];
+
+  // Execute Command
+  if (entry?.Command) executeCommand(entry.Command);
+
+  // Apply VarFloat actions
+  if (entry?.VarFloats) applyVarFloatActions(entry);
+
+  // Apply Intimacy bonus
+  if (entry && intimacyConfig) applyIntimacyBonus(entry);
+
+  // Track in playedMotions
+  playedMotions.add(`${group}:${index}`);
+
+  // Queue NextMtn
+  pendingNextMtn = entry?.NextMtn || motionNextMap[group]?.[index] || null;
+
+  // Show speech bubble
+  if (entry?.Text) showSpeechBubble(entry.Text, entry.TextDelay, entry.TextDuration);
+
+  // Choices UI disabled for now
+  // if (entry?.Choices && entry.Choices.length > 0) showChoicesUI(entry.Choices);
+
+  // Reset interaction time
+  lastInteractionTime = Date.now();
+
+  // Command-only entry (no File)
+  if (entry && !entry.File) {
+    console.log(`[motion] playMotion ${group}:${index} — command-only (no File)`);
+    // Follow NextMtn chain immediately for command-only entries
+    if (pendingNextMtn) {
+      const nextMtn = pendingNextMtn;
+      pendingNextMtn = null;
+      const resolved = resolveMotionRef(nextMtn);
+      const [nextGroup, nextIdxStr] = resolved.split(':');
+      playMotion(nextGroup, nextIdxStr !== undefined ? parseInt(nextIdxStr) : undefined);
+    }
+    return;
+  }
+
+  // Use entry Priority if available
+  const motionPriority = priority ?? (entry?.Priority ?? 2);
+
+  console.log(`[motion] playMotion ${group}:${index} priority=${motionPriority}`);
+  currentModel.motion(group, index, motionPriority);
+}
+
+// Weighted random selection with VarFloat/Intimacy/PreMtn filtering
+function selectMotionIndex(group) {
+  const entries = modelMotions[group];
+  if (!entries || !Array.isArray(entries)) return undefined;
+  const eligible = [];
+  const weights = [];
+  for (let i = 0; i < entries.length; i++) {
+    if (!isMotionEligible(group, i, entries[i])) continue;
+    eligible.push(i);
+    weights.push(entries[i].Weight ?? 1);
+  }
+  if (eligible.length === 0) return undefined;
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < eligible.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return eligible[i];
+  }
+  return eligible[eligible.length - 1];
+}
+
+function isMotionEligible(group, index, entry) {
+  if (!entry) return true;
+  if (entry.Enabled === false) return false;
+  if (entry.VarFloats && !checkVarFloatConditions(entry)) return false;
+  if (intimacyConfig && !checkIntimacyConditions(entry)) return false;
+  if (entry.PreMtn) {
+    const preRef = resolveMotionRef(entry.PreMtn);
+    if (!playedMotions.has(preRef)) return false;
+  }
+  return true;
+}
+
+// --- VarFloats system ---
+
+function checkVarFloatConditions(entry) {
+  if (!entry.VarFloats) return true;
+  for (const vf of entry.VarFloats) {
+    if (vf.Type !== 1) continue; // Type 1 = condition
+    const name = vf.Name;
+    const code = vf.Code || '';
+    let value;
+    if (name && name.startsWith('@') && currentModel) {
+      const paramId = name.substring(1);
+      const cm = currentModel.internalModel.coreModel;
+      const idx = cm.getParameterIndex(paramId);
+      const count = cm.getParameterCount();
+      value = idx < count ? cm.getParameterValueByIndex(idx) : 0;
+    } else {
+      value = varStore[name] ?? 0;
+    }
+    const parts = code.split(/\s+/);
+    const op = parts[0];
+    const target = parseFloat(parts[1]) || 0;
+    if (op === 'equal' && value !== target) return false;
+    if (op === 'not_equal' && value === target) return false;
+    if (op === 'greater' && value <= target) return false;
+    if (op === 'less' && value >= target) return false;
+    if (op === 'greater_equal' && value < target) return false;
+    if (op === 'less_equal' && value > target) return false;
+  }
+  return true;
+}
+
+function applyVarFloatActions(entry) {
+  if (!entry.VarFloats) return;
+  for (const vf of entry.VarFloats) {
+    if (vf.Type !== 2) continue; // Type 2 = action
+    const name = vf.Name;
+    const code = vf.Code || '';
+    const parts = code.split(/\s+/);
+    const op = parts[0];
+    const target = parseFloat(parts[1]) || 0;
+    if (name && name.startsWith('@') && currentModel) {
+      const paramId = name.substring(1);
+      const cm = currentModel.internalModel.coreModel;
+      const idx = cm.getParameterIndex(paramId);
+      const count = cm.getParameterCount();
+      if (idx < count) {
+        if (op === 'assign') cm.setParameterValueByIndex(idx, target);
+        else if (op === 'add') cm.setParameterValueByIndex(idx, cm.getParameterValueByIndex(idx) + target);
+      }
+    } else {
+      if (op === 'assign') varStore[name] = target;
+      else if (op === 'add') varStore[name] = (varStore[name] ?? 0) + target;
+    }
+  }
+}
+
+// --- Intimacy system ---
+
+function checkIntimacyConditions(entry) {
+  const intim = entry.Intimacy;
+  if (!intim || typeof intim !== 'object') return true;
+  if (intim.Min !== undefined && intimacyValue < intim.Min) return false;
+  if (intim.Max !== undefined && intimacyValue > intim.Max) return false;
+  if (intim.Equal !== undefined && intimacyValue !== intim.Equal) return false;
+  return true;
+}
+
+function applyIntimacyBonus(entry) {
+  if (!intimacyConfig) return;
+  const intim = entry.Intimacy;
+  const bonus = intim?.Bonus ?? 0;
+  if (bonus === 0) return;
+  intimacyValue = Math.max(intimacyConfig.minValue, Math.min(intimacyConfig.maxValue, intimacyValue + bonus));
+  invoke('set_setting', { key: `intimacy:${currentModelPath}`, value: String(intimacyValue) }).catch(() => {});
+  console.log(`[intimacy] ${bonus > 0 ? '+' : ''}${bonus} → ${intimacyValue}`);
+}
+
+// --- Command system ---
+
+function executeCommand(cmdString) {
+  if (!cmdString) return;
+  const commands = cmdString.split(';');
+  for (const cmd of commands) {
+    const trimmed = cmd.trim();
+    if (trimmed) executeOneCommand(trimmed);
+  }
+}
+
+function executeOneCommand(cmd) {
+  if (!currentModel) return;
+  const parts = cmd.split(/\s+/);
+  const verb = parts[0];
+  console.log(`[cmd] ${cmd}`);
+
+  switch (verb) {
+    case 'parameters': {
+      const action = parts[1];
+      const id = parts[2];
+      const cm = currentModel.internalModel.coreModel;
+      const paramCount = cm.getParameterCount();
+      if (action === 'lock' && id) {
+        const value = parseFloat(parts[3]) || 0;
+        const duration = parts[4] ? parseFloat(parts[4]) : 0;
+        const idx = cm.getParameterIndex(id);
+        if (idx < paramCount) {
+          lockedParams[id] = { paramIndex: idx, value, startTime: performance.now(), duration };
+        }
+      } else if (action === 'unlock' && id) {
+        for (const pid of id.split(',')) delete lockedParams[pid.trim()];
+      } else if (action === 'set' && id) {
+        const value = parseFloat(parts[3]) || 0;
+        const idx = cm.getParameterIndex(id);
+        if (idx < paramCount) cm.setParameterValueByIndex(idx, value);
+      }
+      break;
+    }
+    case 'start_mtn': {
+      const ref = parts.slice(1).join(' ').trim();
+      if (ref) {
+        const resolved = resolveMotionRef(ref);
+        const [g, idxStr] = resolved.split(':');
+        playMotion(g, idxStr !== undefined ? parseInt(idxStr) : undefined);
+      }
+      break;
+    }
+    case 'stop_mtn': {
+      currentModel.internalModel.motionManager.stopAllMotions();
+      break;
+    }
+    case 'mouse_tracking': {
+      const enable = parts[1] !== 'disable';
+      mouseTracking = enable;
+      currentModel.automator.autoFocus = enable;
+      if (!enable) currentModel.internalModel.focusController.focus(0, 0);
+      break;
+    }
+    case 'eye_blink': {
+      const enable = parts[1] !== 'disable';
+      const im = currentModel.internalModel;
+      if (!enable) {
+        if (im.eyeBlink && !eyeBlinkSave) {
+          eyeBlinkSave = im.eyeBlink;
+          im.eyeBlink = null;
+        }
+      } else if (eyeBlinkSave) {
+        im.eyeBlink = eyeBlinkSave;
+        eyeBlinkSave = null;
+      }
+      break;
+    }
+    case 'physics': {
+      const enable = parts[1] !== 'disable';
+      const im = currentModel.internalModel;
+      if (!enable) {
+        if (im.physics && !physicsSave) {
+          physicsSave = im.physics;
+          im.physics = null;
+        }
+      } else if (physicsSave) {
+        im.physics = physicsSave;
+        physicsSave = null;
+      }
+      break;
+    }
+    case 'motions': {
+      const action = parts[1];
+      const group = parts[2];
+      if (group) {
+        if (action === 'disable') disabledMotionGroups.add(group);
+        else if (action === 'enable') disabledMotionGroups.delete(group);
+      }
+      break;
+    }
+    case 'param_hit': {
+      const action = parts[1];
+      const ids = parts.slice(2).join(' ').split(',').map(s => s.trim());
+      for (const id of ids) {
+        if (action === 'disable') disabledParamHitItems.add(id);
+        else if (action === 'enable') disabledParamHitItems.delete(id);
+      }
+      break;
+    }
+    case 'parts': {
+      const action = parts[1];
+      const partId = parts[2];
+      const value = parseFloat(parts[3]);
+      if (!partId || isNaN(value)) break;
+      const cm = currentModel.internalModel.coreModel;
+      const partCount = cm.getPartCount();
+      const idx = cm.getPartIndex(partId);
+      if (idx < partCount) {
+        cm.setPartOpacityByIndex(idx, value);
+        if (action === 'lock') lockedParts[partId] = { index: idx, value };
+        else if (action === 'unlock') delete lockedParts[partId];
+      }
+      break;
+    }
+    case 'artmesh_opacities': {
+      console.log(`[cmd] artmesh_opacities deferred: ${parts.slice(1).join(' ')}`);
+      break;
+    }
+    case 'mute_sound': {
+      soundMuted = parts[1] === '1';
+      import('untitled-pixi-live2d-engine').then(mod => {
+        if (mod.SoundManager) mod.SoundManager.volume = soundMuted ? 0 : 1;
+      }).catch(() => {});
+      break;
+    }
+    case 'stop_sound': {
+      console.log(`[cmd] stop_sound: ${parts.slice(1).join(' ')}`);
+      break;
+    }
+    case 'open_url': {
+      console.log(`[cmd] open_url ignored (security): ${parts.slice(1).join(' ')}`);
+      break;
+    }
+    case 'replace_tex': {
+      console.log(`[cmd] replace_tex deferred: ${parts.slice(1).join(' ')}`);
+      break;
+    }
+    default:
+      console.log(`[cmd] unknown command: ${cmd}`);
+  }
+}
+
+// --- Speech bubble ---
+
+function showSpeechBubble(text, delay, duration) {
+  clearTimeout(speechBubbleTimeout);
+  const show = () => {
+    speechBubble.textContent = text;
+    speechBubble.style.display = 'block';
+    if (currentModel) {
+      const bounds = currentModel.getBounds();
+      speechBubble.style.left = (bounds.x + bounds.width / 2) + 'px';
+      speechBubble.style.bottom = (window.innerHeight - bounds.y + 16) + 'px';
+    }
+    speechBubbleTimeout = setTimeout(() => {
+      speechBubble.style.display = 'none';
+    }, duration || 5000);
+  };
+  if (delay && delay > 0) {
+    speechBubbleTimeout = setTimeout(show, delay);
+  } else {
+    show();
+  }
+}
+
+// --- Choices UI ---
+
+function showChoicesUI(choices) {
+  choicesContainer.innerHTML = '';
+  setFullInputRegion();
+  for (const choice of choices) {
+    const item = document.createElement('div');
+    item.className = 'choices-item';
+    item.textContent = choice.Text || '';
+    item.addEventListener('click', () => {
+      choicesContainer.style.display = 'none';
+      updateInputRegion();
+      if (choice.NextMtn) {
+        const resolved = resolveMotionRef(choice.NextMtn);
+        const [g, idxStr] = resolved.split(':');
+        playMotion(g, idxStr !== undefined ? parseInt(idxStr) : undefined);
+      }
+    });
+    choicesContainer.appendChild(item);
+  }
+  // Position near model center
+  if (currentModel) {
+    const bounds = currentModel.getBounds();
+    choicesContainer.style.left = (bounds.x + bounds.width / 2) + 'px';
+    choicesContainer.style.top = (bounds.y + bounds.height / 2) + 'px';
+  }
+  choicesContainer.style.display = 'block';
+}
+
+// --- Leave groups (timed idle) ---
+
+function parseLeaveGroups(motions) {
+  leaveGroups = [];
+  for (const groupName of Object.keys(motions)) {
+    const match = groupName.match(/^Leave(\d+)_(\d+)_(\d+)$/);
+    if (match) {
+      leaveGroups.push({
+        group: groupName,
+        interval: parseInt(match[1]),
+        minDuration: parseInt(match[2]),
+        maxDuration: parseInt(match[3]),
+      });
+    }
+  }
+}
+
+function startLeaveTimer() {
+  if (leaveTimeout) clearInterval(leaveTimeout);
+  lastInteractionTime = Date.now();
+  if (leaveGroups.length === 0) return;
+  leaveTimeout = setInterval(checkLeaveTimers, 5000);
+}
+
+function checkLeaveTimers() {
+  if (!currentModel || leaveActive) return;
+  const idle = (Date.now() - lastInteractionTime) / 1000;
+  for (const lg of leaveGroups) {
+    if (idle >= lg.interval) {
+      console.log(`[motion] Leave timer fired: ${lg.group} (idle ${idle.toFixed(0)}s >= ${lg.interval}s)`);
+      leaveActive = true;
+      playMotion(lg.group, undefined, 1);
+      const dur = lg.minDuration + Math.random() * (lg.maxDuration - lg.minDuration);
+      setTimeout(() => { leaveActive = false; }, dur * 1000);
+      break;
+    }
+  }
+}
+
+// --- Drag release handlers ---
 
 function handleParamHitRelease() {
   const { item, paramIndex, currentValue, startValue } = paramDragging;
@@ -762,6 +1253,30 @@ async function loadModel(modelPath) {
   paramHitItems = [];
   paramLoopItems = [];
   dragScrubState = null;
+  // Reset feature state
+  motionEntryMap = {};
+  varStore = {};
+  lockedParams = {};
+  lockedParts = {};
+  disabledMotionGroups = new Set();
+  disabledParamHitItems = new Set();
+  currentMotionInfo = null;
+  playedMotions = new Set();
+  leaveGroups = [];
+  if (leaveTimeout) { clearInterval(leaveTimeout); leaveTimeout = null; }
+  leaveActive = false;
+  keyTriggerItems = [];
+  paramTriggerItems = [];
+  paramTriggerLastValues = {};
+  clearTimeout(speechBubbleTimeout);
+  speechBubble.style.display = 'none';
+  choicesContainer.style.display = 'none';
+  extraMotionEnabled = false;
+  eyeBlinkSave = null;
+  physicsSave = null;
+  soundMuted = false;
+  intimacyConfig = null;
+  intimacyValue = 50;
 
   if (currentModel) {
     app.ticker.remove(drawHitAreas);
@@ -825,6 +1340,7 @@ async function loadModel(modelPath) {
     // Drag start (left button only)
     model.on('pointerdown', (e) => {
       if (e.button !== 0) return;
+      lastInteractionTime = Date.now();
 
       // Check for ParamHit drag areas first
       if (paramHitItems.length > 0) {
@@ -832,6 +1348,7 @@ async function loadModel(modelPath) {
         for (const name of hitNames) {
           const item = paramHitItems.find(i => i.hitArea === name);
           if (!item) continue;
+          if (disabledParamHitItems.has(item.hitArea)) continue;
           if (item.paramIndex >= 0) {
             // Real parameter: drag to control parameter value
             console.log(`[touch] pointerdown on ParamHit area: ${item.hitArea} (param: ${item.paramId})`);
@@ -913,9 +1430,11 @@ async function loadModel(modelPath) {
     buildHitMotionMap(rawHitAreas, customJsonStr);
     pendingNextMtn = null;
 
+    // Parse controllers
+    const controllers = rawJson.Controllers || rawJson.controllers || {};
+
     // Parse ParamHit controller items (drag-to-control-parameter hit areas)
     // Falls back to legacy top-level HitParams when Controllers.ParamHit is absent
-    const controllers = rawJson.Controllers || rawJson.controllers || {};
     const paramHitConfig = controllers.ParamHit || controllers.paramHit || {};
     const paramHitEnabled = paramHitConfig.Enabled !== false && paramHitConfig.enabled !== false;
     const paramHitRawItems = paramHitEnabled
@@ -983,6 +1502,112 @@ async function loadModel(modelPath) {
       }
     }
 
+    // Parse KeyTrigger controller
+    const keyTriggerConfig = controllers.KeyTrigger || {};
+    if (keyTriggerConfig.Enabled !== false) {
+      const items = keyTriggerConfig.Items || [];
+      for (const item of items) {
+        if (item.Enabled === false) continue;
+        keyTriggerItems.push({
+          keyCode: item.Input,
+          downMtn: item.DownMtn ? resolveMotionRef(item.DownMtn) : null,
+        });
+      }
+    }
+
+    // Parse ParamTrigger controller
+    const paramTriggerConfig = controllers.ParamTrigger || {};
+    if (paramTriggerConfig.Enabled !== false) {
+      const ptItems = paramTriggerConfig.Items || [];
+      const coreModel = model.internalModel.coreModel;
+      const paramCount = coreModel.getParameterCount();
+      for (const item of ptItems) {
+        if (item.Enabled === false) continue;
+        const paramId = item.Id;
+        if (!paramId) continue;
+        const rawIdx = coreModel.getParameterIndex(paramId);
+        const paramIndex = rawIdx < paramCount ? rawIdx : -1;
+        if (paramIndex < 0) continue;
+        paramTriggerItems.push({
+          paramId,
+          paramIndex,
+          triggers: (item.Items || []).map(t => ({
+            value: t.Value ?? 0,
+            motion: t.Motion ? resolveMotionRef(t.Motion) : null,
+            direction: t.Direction ?? 0,
+          })),
+        });
+        paramTriggerLastValues[paramId] = coreModel.getParameterValueByIndex(paramIndex);
+      }
+    }
+
+    // Parse PartOpacity controller
+    const partOpacityConfig = controllers.PartOpacity || {};
+    if (partOpacityConfig.Enabled !== false) {
+      const poItems = partOpacityConfig.Items || [];
+      const coreModel = model.internalModel.coreModel;
+      const partCount = coreModel.getPartCount();
+      for (const item of poItems) {
+        if (item.Enabled === false) continue;
+        const value = item.Value ?? 1;
+        const ids = item.Ids || (item.Id ? [item.Id] : []);
+        for (const partId of ids) {
+          if (!partId) continue;
+          const idx = coreModel.getPartIndex(partId);
+          if (idx < partCount) {
+            coreModel.setPartOpacityByIndex(idx, value);
+            if (item.Lock) lockedParts[partId] = { index: idx, value };
+          }
+        }
+      }
+    }
+
+    // Parse ParamValue controller
+    const paramValueConfig = controllers.ParamValue || {};
+    if (paramValueConfig.Enabled !== false) {
+      const pvItems = paramValueConfig.Items || [];
+      const coreModel = model.internalModel.coreModel;
+      const paramCount = coreModel.getParameterCount();
+      for (const item of pvItems) {
+        if (item.Enabled === false) continue;
+        const value = item.Value ?? 0;
+        const ids = item.Ids || (item.Id ? [item.Id] : []);
+        for (const paramId of ids) {
+          if (!paramId) continue;
+          const rawIdx = coreModel.getParameterIndex(paramId);
+          if (rawIdx < paramCount) {
+            coreModel.setParameterValueByIndex(rawIdx, value);
+            lockedParams[paramId] = { paramIndex: rawIdx, value, startTime: performance.now(), duration: 0 };
+          }
+        }
+      }
+    }
+
+    // Parse ExtraMotion controller
+    const extraMotionConfig = controllers.ExtraMotion || {};
+    extraMotionEnabled = extraMotionConfig.Enabled === true || rawJson.ExtraMotion === true;
+
+    // Parse IntimacySystem controller
+    const intimacySystem = controllers.IntimacySystem || rawJson.IntimacyParam || {};
+    if (intimacySystem.MaxValue !== undefined || intimacySystem.maxValue !== undefined) {
+      intimacyConfig = {
+        initValue: intimacySystem.InitValue ?? intimacySystem.initValue ?? 50,
+        minValue: intimacySystem.MinValue ?? intimacySystem.minValue ?? 0,
+        maxValue: intimacySystem.MaxValue ?? intimacySystem.maxValue ?? 100,
+      };
+      // Try to load persisted intimacy value
+      try {
+        const saved = await invoke('get_setting', { key: `intimacy:${currentModelPath}` });
+        if (saved !== null && saved !== undefined) intimacyValue = parseFloat(saved);
+        else intimacyValue = intimacyConfig.initValue;
+      } catch {
+        intimacyValue = intimacyConfig.initValue;
+      }
+    }
+
+    // Parse Leave groups for timed idle
+    parseLeaveGroups(modelMotions);
+
     // Override motionManager.update to apply paramHit values at the right
     // point in the update cycle (after motions, before physics/coreModel.update)
     const origMotionUpdate = model.internalModel.motionManager.update;
@@ -1020,10 +1645,47 @@ async function loadModel(modelPath) {
         cm.setParameterValueByIndex(anim.paramIndex, v);
       }
       paramReleaseAnims = paramReleaseAnims.filter(a => a.t < 1);
+
+      // Enforce locked params (from commands + ParamValue controller)
+      const nowMs = performance.now();
+      for (const [id, lock] of Object.entries(lockedParams)) {
+        if (lock.duration > 0 && nowMs - lock.startTime > lock.duration) {
+          delete lockedParams[id];
+          continue;
+        }
+        cm.setParameterValueByIndex(lock.paramIndex, lock.value);
+      }
+
+      // Enforce locked parts
+      for (const [, lock] of Object.entries(lockedParts)) {
+        cm.setPartOpacityByIndex(lock.index, lock.value);
+      }
+
+      // ParamTrigger: detect threshold crossings
+      for (const pt of paramTriggerItems) {
+        const curVal = cm.getParameterValueByIndex(pt.paramIndex);
+        const prevVal = paramTriggerLastValues[pt.paramId] ?? curVal;
+        for (const trigger of pt.triggers) {
+          const increasing = prevVal < trigger.value && curVal >= trigger.value;
+          const decreasing = prevVal > trigger.value && curVal <= trigger.value;
+          const crossed = (trigger.direction === 0 && (increasing || decreasing)) ||
+                          (trigger.direction === 1 && increasing) ||
+                          (trigger.direction === 2 && decreasing);
+          if (crossed && trigger.motion) {
+            const [g, idxStr] = trigger.motion.split(':');
+            console.log(`[trigger] ParamTrigger ${pt.paramId} crossed ${trigger.value}: ${trigger.motion}`);
+            playMotion(g, idxStr !== undefined ? parseInt(idxStr) : undefined);
+          }
+        }
+        paramTriggerLastValues[pt.paramId] = curVal;
+      }
+
       // ParamLoop: auto-oscillate parameters between min and max
       if (paramLoopItems.length > 0) {
         const now = performance.now();
         for (const loop of paramLoopItems) {
+          // Skip if this param is being dragged with LockParam
+          if (paramDragging?.item?.lockParam && loop.paramIndex === paramDragging.paramIndex) continue;
           const elapsed = now - loop.startTime;
           const phase = (elapsed % loop.duration) / loop.duration; // 0..1
           const min = cm.getParameterMinimumValue(loop.paramIndex);
@@ -1051,30 +1713,57 @@ async function loadModel(modelPath) {
       }
     };
 
-    // Set loop flag on motions with FileLoop: true in model JSON
+    // Set loop flag and FadeIn/FadeOut on motions
     model.internalModel.motionManager.on('motionLoaded', (group, index, motion) => {
       if (fileLoopMap[group]?.[index]) {
         motion.setLoop(true);
         motion.setLoopFadeIn(false);
       }
+      const entry = motionEntryMap[group]?.[index];
+      if (entry?.FadeIn !== undefined) motion.setFadeInTime(entry.FadeIn / 1000);
+      if (entry?.FadeOut !== undefined) motion.setFadeOutTime(entry.FadeOut / 1000);
     });
 
-    // NextMtn chaining: when a motion finishes, play its NextMtn if set
+    // Track current motion via motionStart event
+    model.internalModel.motionManager.on('motionStart', (group, index) => {
+      const entry = motionEntryMap[group]?.[index];
+      currentMotionInfo = { group, index, entry };
+    });
+
+    // NextMtn chaining + PostCommand: when a motion finishes
     model.internalModel.motionManager.on('motionFinish', () => {
       playingStart = false;
+
+      // Execute PostCommand from the finished motion
+      if (currentMotionInfo?.entry?.PostCommand) {
+        executeCommand(currentMotionInfo.entry.PostCommand);
+      }
+      currentMotionInfo = null;
+
       if (pendingNextMtn) {
         const mtn = pendingNextMtn;
         pendingNextMtn = null;
         const resolved = resolveMotionRef(mtn);
         const [group, idxStr] = resolved.split(':');
-        model.motion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
+        playMotion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
       } else if (idleGroup) {
-        // Loop idle animation when no other motion is queued
-        model.motion(idleGroup, undefined, 1); // IDLE priority, random index
+        playMotion(idleGroup, undefined, 1);
+        // ExtraMotion: play layered idles
+        if (extraMotionEnabled && currentModel?.parallelMotion) {
+          const extraMotions = [];
+          for (let n = 1; modelMotions[`Idle#${n}`]; n++) {
+            const idx = selectMotionIndex(`Idle#${n}`) ?? 0;
+            extraMotions.push({ group: `Idle#${n}`, index: idx, priority: 1 });
+          }
+          if (extraMotions.length > 0) {
+            currentModel.parallelMotion(extraMotions).catch(() => {});
+          }
+        }
       }
     });
 
     model.on('pointertap', (e) => {
+      lastInteractionTime = Date.now();
       if (playingStart) {
         console.log('[touch] pointertap — skipped (start animation playing)');
         playingStart = false;
@@ -1099,22 +1788,29 @@ async function loadModel(modelPath) {
           const [group, idxStr] = mapped.split(':');
           const arrayIdx = idxStr !== undefined ? parseInt(idxStr) : undefined;
           console.log(`[touch] ${name}: triggering mapped motion ${group}` + (arrayIdx !== undefined ? `:${arrayIdx}` : ''));
-          const result = model.motion(group, arrayIdx);
-          console.log(`[touch] ${name}: model.motion() returned`, result);
-          // Queue NextMtn if this motion has one
-          pendingNextMtn = (arrayIdx !== undefined && motionNextMap[group]?.[arrayIdx]) || null;
+          playMotion(group, arrayIdx);
           return; // stop — don't trigger overlapping hit areas
         }
         // Convention fallbacks (only when no explicit mapping)
         console.log(`[touch] ${name}: no mapping, trying conventions (tap_${name}, ${name}, Tap${name})`);
-        pendingNextMtn = null;
-        model.motion('tap_' + name);
-        model.motion(name);
-        model.motion('Tap' + name);
+        const conventions = ['tap_' + name, name, 'Tap' + name];
         const stripped = name.replace(/^Touch/i, '');
-        if (stripped !== name) {
-          model.motion(stripped.toLowerCase());
+        if (stripped !== name) conventions.push(stripped.toLowerCase());
+        let found = false;
+        for (const g of conventions) {
+          if (modelMotions[g]) {
+            playMotion(g);
+            found = true;
+            break;
+          }
         }
+        if (found) return;
+        // If no convention matched, still try direct calls as fallback
+        pendingNextMtn = null;
+        currentModel.motion('tap_' + name);
+        currentModel.motion(name);
+        currentModel.motion('Tap' + name);
+        if (stripped !== name) currentModel.motion(stripped.toLowerCase());
         return; // stop — don't trigger overlapping hit areas
       }
     });
@@ -1147,10 +1843,13 @@ async function loadModel(modelPath) {
     const startGroup = motions['Start'] ? 'Start' : motions['start'] ? 'start' : null;
     if (startGroup) {
       playingStart = true;
-      model.motion(startGroup, 0, 1); // priority IDLE so taps can interrupt
+      playMotion(startGroup, 0, 1); // priority IDLE so taps can interrupt
     } else if (idleGroup) {
-      model.motion(idleGroup, undefined, 1); // start idle loop immediately
+      playMotion(idleGroup, undefined, 1);
     }
+
+    // Start Leave timer
+    startLeaveTimer();
   } catch (err) {
     console.error('[rive2d] Failed to load model:', err);
   }

@@ -154,6 +154,7 @@ pub fn run() {
             add_models_from_dir,
             remove_model,
             set_setting,
+            get_setting,
             update_input_region,
             open_settings,
             get_model_info,
@@ -459,6 +460,11 @@ async fn apply_model(app: tauri::AppHandle, path: String) -> Result<(), String> 
 fn set_setting(app: tauri::AppHandle, key: String, value: String) {
     config::set_setting(&app, &key, &value);
     app.emit("setting-changed", (&key, &value)).ok();
+}
+
+#[tauri::command]
+fn get_setting(app: tauri::AppHandle, key: String) -> Option<String> {
+    config::get_setting(&app, &key)
 }
 
 /// Given a model JSON path, return the absolute path to a preview image.
