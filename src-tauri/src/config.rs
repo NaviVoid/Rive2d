@@ -40,6 +40,16 @@ fn open_db(app: &tauri::AppHandle) -> Connection {
         );",
     )
     .expect("Failed to initialize database");
+
+    // Add source_hash column if missing (migration for existing DBs)
+    let has_hash: bool = conn
+        .prepare("SELECT source_hash FROM models LIMIT 0")
+        .is_ok();
+    if !has_hash {
+        conn.execute_batch("ALTER TABLE models ADD COLUMN source_hash TEXT")
+            .ok();
+    }
+
     conn
 }
 
@@ -139,10 +149,23 @@ pub fn load(app: &tauri::AppHandle) -> AppConfig {
     }
 }
 
-pub fn add_model(app: &tauri::AppHandle, path: &str) {
+pub fn has_hash(app: &tauri::AppHandle, hash: &str) -> bool {
     let conn = open_db(app);
-    conn.execute("INSERT OR IGNORE INTO models (path) VALUES (?1)", [path])
-        .ok();
+    conn.query_row(
+        "SELECT 1 FROM models WHERE source_hash = ?1",
+        [hash],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+pub fn add_model(app: &tauri::AppHandle, path: &str, source_hash: Option<&str>) {
+    let conn = open_db(app);
+    conn.execute(
+        "INSERT OR IGNORE INTO models (path, source_hash) VALUES (?1, ?2)",
+        rusqlite::params![path, source_hash],
+    )
+    .ok();
 }
 
 pub fn remove_model(app: &tauri::AppHandle, path: &str) {
@@ -197,6 +220,9 @@ pub fn set_model(app: &tauri::AppHandle, path: &str) {
         [path],
     )
     .ok();
-    conn.execute("INSERT OR IGNORE INTO models (path) VALUES (?1)", [path])
-        .ok();
+    conn.execute(
+        "INSERT OR IGNORE INTO models (path) VALUES (?1)",
+        [path],
+    )
+    .ok();
 }

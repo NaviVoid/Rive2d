@@ -151,6 +151,7 @@ pub fn run() {
             set_model_preview,
             apply_model,
             add_model,
+            add_models_from_dir,
             remove_model,
             set_setting,
             update_input_region,
@@ -254,14 +255,24 @@ fn add_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
         return Err("File not found".to_string());
     }
 
+    let hash = file_md5(p)?;
+    if config::has_hash(&app, &hash) {
+        return Err("Model already imported".to_string());
+    }
+
     let model_path = match p.extension().and_then(|e| e.to_str()) {
         Some("lpk") => extract_lpk(&app, &path)?,
         Some("json") => path,
         _ => return Err("Unsupported format. Use .lpk or .model3.json".to_string()),
     };
 
-    config::add_model(&app, &model_path);
+    config::add_model(&app, &model_path, Some(&hash));
     Ok(())
+}
+
+fn file_md5(path: &std::path::Path) -> Result<String, String> {
+    let data = std::fs::read(path).map_err(|e| e.to_string())?;
+    Ok(format!("{:x}", md5::compute(&data)))
 }
 
 fn extract_lpk(app: &tauri::AppHandle, lpk_path: &str) -> Result<String, String> {
@@ -279,6 +290,72 @@ fn extract_lpk(app: &tauri::AppHandle, lpk_path: &str) -> Result<String, String>
         .join(stem);
 
     lpk::extract_lpk(&models_dir, lpk_path)
+}
+
+#[derive(serde::Serialize)]
+struct ImportResult {
+    imported: u32,
+    errors: Vec<String>,
+}
+
+#[tauri::command]
+fn add_models_from_dir(app: tauri::AppHandle, path: String) -> Result<ImportResult, String> {
+    let dir = std::path::Path::new(&path);
+    if !dir.is_dir() {
+        return Err("Not a directory".to_string());
+    }
+
+    let mut imported = 0u32;
+    let mut errors = Vec::new();
+    walk_for_lpk(dir, 0, 5, &app, &mut imported, &mut errors);
+
+    if imported == 0 && errors.is_empty() {
+        return Err("No .lpk files found".to_string());
+    }
+
+    Ok(ImportResult { imported, errors })
+}
+
+fn walk_for_lpk(
+    dir: &std::path::Path,
+    depth: u32,
+    max_depth: u32,
+    app: &tauri::AppHandle,
+    imported: &mut u32,
+    errors: &mut Vec<String>,
+) {
+    if depth > max_depth {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_for_lpk(&path, depth + 1, max_depth, app, imported, errors);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("lpk") {
+            let path_str = path.to_string_lossy().to_string();
+            let hash = match file_md5(&path) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            if config::has_hash(app, &hash) {
+                continue;
+            }
+            match extract_lpk(app, &path_str) {
+                Ok(model_path) => {
+                    config::add_model(app, &model_path, Some(&hash));
+                    *imported += 1;
+                }
+                Err(e) => {
+                    let name = path.file_name().map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or(path_str);
+                    errors.push(format!("{}: {}", name, e));
+                }
+            }
+        }
+    }
 }
 
 #[tauri::command]

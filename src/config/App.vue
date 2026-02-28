@@ -102,6 +102,8 @@ async function refreshConfig() {
   }
 }
 
+const importing = ref(false);
+
 async function importModel() {
   const selected = await open({
     multiple: false,
@@ -113,6 +115,23 @@ async function importModel() {
   if (selected) {
     await invoke('add_model', { path: selected });
     await refreshConfig();
+  }
+}
+
+async function importFolder() {
+  const selected = await open({ directory: true });
+  if (!selected) return;
+  importing.value = true;
+  try {
+    const result = await invoke('add_models_from_dir', { path: selected });
+    if (result.errors.length > 0) {
+      console.warn('Some imports failed:', result.errors);
+    }
+    await refreshConfig();
+  } catch (err) {
+    console.error('Folder import failed:', err);
+  } finally {
+    importing.value = false;
   }
 }
 
@@ -185,7 +204,10 @@ onMounted(refreshConfig);
         <button class="tab" :class="{ active: activeTab === 'models' }" @click="activeTab = 'models'">Models</button>
         <button class="tab" :class="{ active: activeTab === 'settings' }" @click="activeTab = 'settings'">Settings</button>
       </div>
-      <button v-if="activeTab === 'models' && !detailModel" class="import-btn" @click="importModel">+ Import</button>
+      <div v-if="activeTab === 'models' && !detailModel" class="import-group">
+        <button class="import-btn" @click="importModel">+ Import</button>
+        <button class="import-btn" @click="importFolder" :disabled="importing">{{ importing ? 'Importing...' : '+ Folder' }}</button>
+      </div>
     </header>
 
     <template v-if="activeTab === 'models'">
@@ -350,6 +372,11 @@ button {
   transition: background 0.2s;
 }
 
+.import-group {
+  display: flex;
+  gap: 6px;
+}
+
 .import-btn {
   padding: 8px 16px;
   background: #89b4fa;
@@ -359,6 +386,11 @@ button {
 
 .import-btn:hover {
   background: #74c7ec;
+}
+
+.import-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 
 .model-list {
