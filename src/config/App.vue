@@ -12,6 +12,13 @@ const showHitAreas = ref(false);
 const lockModel = ref(false);
 const previews = ref({});
 
+// Detail view state
+const detailModel = ref(null);   // path being edited, null = list view
+const modelInfo = ref(null);     // from get_model_info
+const editName = ref('');
+const editMotions = ref({});     // { hitAreaName: motionGroup }
+const customNames = ref({});     // { path: name } for all models
+
 async function loadPreviews(modelPaths) {
   for (const path of modelPaths) {
     if (previews.value[path]) continue;
@@ -24,6 +31,61 @@ async function loadPreviews(modelPaths) {
   }
 }
 
+async function loadCustomNames(modelPaths) {
+  try {
+    const names = await invoke('get_model_names', { paths: modelPaths });
+    customNames.value = names;
+  } catch {}
+}
+
+function displayName(path) {
+  return customNames.value[path] || fileName(path);
+}
+
+async function openDetail(path) {
+  try {
+    const info = await invoke('get_model_info', { path });
+    modelInfo.value = info;
+    editName.value = info.custom_name || '';
+    // Build motions edit state from saved custom mappings
+    const saved = info.custom_motions ? JSON.parse(info.custom_motions) : {};
+    editMotions.value = {};
+    for (const ha of info.hit_areas) {
+      editMotions.value[ha.name] = saved[ha.name] || '';
+    }
+    detailModel.value = path;
+  } catch (err) {
+    console.error('Failed to load model info:', err);
+  }
+}
+
+async function saveDetail() {
+  const path = detailModel.value;
+  if (!path) return;
+
+  // Save custom name
+  await invoke('set_model_name', { path, name: editName.value.trim() });
+  if (editName.value.trim()) {
+    customNames.value[path] = editName.value.trim();
+  } else {
+    delete customNames.value[path];
+  }
+
+  // Save motion mappings (only non-empty overrides)
+  const overrides = {};
+  for (const [name, group] of Object.entries(editMotions.value)) {
+    if (group) overrides[name] = group;
+  }
+  await invoke('set_model_motions', { path, mappings: JSON.stringify(overrides) });
+
+  closeDetail();
+}
+
+function closeDetail() {
+  detailModel.value = null;
+  modelInfo.value = null;
+}
+
 async function refreshConfig() {
   try {
     const config = await invoke('get_config');
@@ -34,6 +96,7 @@ async function refreshConfig() {
     showHitAreas.value = config.show_hit_areas;
     lockModel.value = config.lock_model;
     loadPreviews(config.models);
+    loadCustomNames(config.models);
   } catch (err) {
     console.error('Failed to load config:', err);
   }
@@ -122,11 +185,56 @@ onMounted(refreshConfig);
         <button class="tab" :class="{ active: activeTab === 'models' }" @click="activeTab = 'models'">Models</button>
         <button class="tab" :class="{ active: activeTab === 'settings' }" @click="activeTab = 'settings'">Settings</button>
       </div>
-      <button v-if="activeTab === 'models'" class="import-btn" @click="importModel">+ Import</button>
+      <button v-if="activeTab === 'models' && !detailModel" class="import-btn" @click="importModel">+ Import</button>
     </header>
 
     <template v-if="activeTab === 'models'">
-      <section class="model-list" v-if="models.length > 0">
+      <!-- Detail/Edit View -->
+      <section v-if="detailModel" class="detail-view">
+        <button class="back-btn" @click="closeDetail">&larr; Back</button>
+
+        <div class="detail-header">
+          <div class="detail-preview" @click="uploadPreview(detailModel)" title="Click to change preview">
+            <img v-if="previews[detailModel]" :src="previews[detailModel]" alt="preview" />
+            <div v-else class="no-preview">+</div>
+          </div>
+          <div class="detail-name-section">
+            <label class="field-label">Display Name</label>
+            <input
+              v-model="editName"
+              class="name-input"
+              type="text"
+              :placeholder="fileName(detailModel)"
+            />
+          </div>
+        </div>
+
+        <div v-if="modelInfo && modelInfo.hit_areas.length > 0" class="motions-section">
+          <h3 class="section-title">Hit Area Motions</h3>
+          <div class="motion-table">
+            <div v-for="ha in modelInfo.hit_areas" :key="ha.name" class="motion-row">
+              <span class="motion-label">{{ ha.name }}</span>
+              <select v-model="editMotions[ha.name]" class="motion-select">
+                <option value="">(default)</option>
+                <option :value="'__none__'">(none)</option>
+                <option
+                  v-for="group in modelInfo.motion_groups"
+                  :key="group"
+                  :value="group"
+                >{{ group }}</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="detail-actions">
+          <button class="save-btn" @click="saveDetail">Save</button>
+          <button class="cancel-btn" @click="closeDetail">Cancel</button>
+        </div>
+      </section>
+
+      <!-- Model List -->
+      <section class="model-list" v-else-if="models.length > 0">
         <div
           v-for="model in models"
           :key="model"
@@ -137,8 +245,8 @@ onMounted(refreshConfig);
             <img v-if="previews[model]" :src="previews[model]" alt="preview" />
             <div v-else class="no-preview">+</div>
           </div>
-          <div class="model-info">
-            <span class="model-name">{{ fileName(model) }}</span>
+          <div class="model-info" @click="openDetail(model)" style="cursor: pointer">
+            <span class="model-name">{{ displayName(model) }}</span>
           </div>
           <div class="model-actions">
             <span v-if="model === currentModel" class="badge">Active</span>
@@ -422,6 +530,160 @@ button {
 
 .toggle.on .toggle-knob {
   transform: translateX(16px);
+}
+
+/* Detail view */
+.detail-view {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  flex: 1;
+}
+
+.back-btn {
+  align-self: flex-start;
+  padding: 6px 12px;
+  background: transparent;
+  color: #89b4fa;
+  font-size: 14px;
+}
+
+.back-btn:hover {
+  background: #313244;
+}
+
+.detail-header {
+  display: flex;
+  gap: 20px;
+  align-items: flex-start;
+}
+
+.detail-preview {
+  width: 140px;
+  height: 140px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #313244;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.detail-preview:hover {
+  opacity: 0.8;
+}
+
+.detail-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.detail-name-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+}
+
+.field-label {
+  font-size: 12px;
+  color: #6c7086;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.name-input {
+  padding: 8px 12px;
+  background: #313244;
+  border: 1px solid #45475a;
+  border-radius: 6px;
+  color: #cdd6f4;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.name-input:focus {
+  border-color: #89b4fa;
+}
+
+.motions-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.section-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: #a6adc8;
+  margin: 0;
+}
+
+.motion-table {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.motion-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: #313244;
+  border-radius: 6px;
+}
+
+.motion-label {
+  font-size: 13px;
+  color: #cdd6f4;
+}
+
+.motion-select {
+  padding: 5px 8px;
+  background: #45475a;
+  border: 1px solid #585b70;
+  border-radius: 4px;
+  color: #cdd6f4;
+  font-size: 13px;
+  outline: none;
+  min-width: 160px;
+}
+
+.motion-select:focus {
+  border-color: #89b4fa;
+}
+
+.detail-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: auto;
+}
+
+.save-btn {
+  padding: 8px 20px;
+  background: #89b4fa;
+  color: #1e1e2e;
+  font-weight: 600;
+}
+
+.save-btn:hover {
+  background: #74c7ec;
+}
+
+.cancel-btn {
+  padding: 8px 20px;
+  background: #45475a;
+  color: #cdd6f4;
+}
+
+.cancel-btn:hover {
+  background: #585b70;
 }
 
 </style>

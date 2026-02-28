@@ -5,6 +5,7 @@ mod config;
 mod lpk;
 mod tray;
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
 
@@ -154,6 +155,11 @@ pub fn run() {
             set_setting,
             update_input_region,
             open_settings,
+            get_model_info,
+            set_model_name,
+            set_model_motions,
+            get_model_names,
+            get_custom_motions,
             js_log
         ]);
 
@@ -414,6 +420,141 @@ fn update_input_region(app: tauri::AppHandle, x: i32, y: i32, width: i32, height
 #[tauri::command]
 fn open_settings(app: tauri::AppHandle) {
     create_config_window(&app);
+}
+
+#[derive(serde::Serialize)]
+struct HitAreaInfo {
+    name: String,
+    id: String,
+    default_motion: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ModelInfo {
+    hit_areas: Vec<HitAreaInfo>,
+    motion_groups: Vec<String>,
+    custom_name: Option<String>,
+    custom_motions: Option<String>,
+}
+
+#[tauri::command]
+fn get_model_info(app: tauri::AppHandle, path: String) -> Result<ModelInfo, String> {
+    let json_str = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| e.to_string())?;
+
+    let mut hit_areas = Vec::new();
+    let mut motion_groups = Vec::new();
+
+    // Cubism 3/4: HitAreas with {Name, Id, Motion}
+    if let Some(areas) = json.get("HitAreas").and_then(|v| v.as_array()) {
+        for area in areas {
+            let name = area
+                .get("Name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let id = area
+                .get("Id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let motion = area
+                .get("Motion")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            hit_areas.push(HitAreaInfo {
+                name,
+                id,
+                default_motion: motion,
+            });
+        }
+    }
+
+    // Cubism 2: hit_areas with {name, id}
+    if hit_areas.is_empty() {
+        if let Some(areas) = json.get("hit_areas").and_then(|v| v.as_array()) {
+            for area in areas {
+                let name = area
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let id = area
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                hit_areas.push(HitAreaInfo {
+                    name,
+                    id,
+                    default_motion: None,
+                });
+            }
+        }
+    }
+
+    // Motion groups - Cubism 3/4
+    if let Some(motions) = json
+        .get("FileReferences")
+        .and_then(|fr| fr.get("Motions"))
+        .and_then(|v| v.as_object())
+    {
+        motion_groups = motions.keys().cloned().collect();
+    }
+    // Motion groups - Cubism 2
+    if motion_groups.is_empty() {
+        if let Some(motions) = json.get("motions").and_then(|v| v.as_object()) {
+            motion_groups = motions.keys().cloned().collect();
+        }
+    }
+    motion_groups.sort();
+
+    let custom_name = config::get_setting(&app, &format!("name:{}", path));
+    let custom_motions = config::get_setting(&app, &format!("motions:{}", path));
+
+    Ok(ModelInfo {
+        hit_areas,
+        motion_groups,
+        custom_name,
+        custom_motions,
+    })
+}
+
+#[tauri::command]
+fn set_model_name(app: tauri::AppHandle, path: String, name: String) {
+    let key = format!("name:{}", path);
+    if name.is_empty() {
+        config::delete_settings(&app, &[&key]);
+    } else {
+        config::set_setting(&app, &key, &name);
+    }
+}
+
+#[tauri::command]
+fn set_model_motions(app: tauri::AppHandle, path: String, mappings: String) {
+    let key = format!("motions:{}", path);
+    if mappings == "{}" || mappings.is_empty() {
+        config::delete_settings(&app, &[&key]);
+    } else {
+        config::set_setting(&app, &key, &mappings);
+    }
+    app.emit("motions-changed", &path).ok();
+}
+
+#[tauri::command]
+fn get_model_names(app: tauri::AppHandle, paths: Vec<String>) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    for path in paths {
+        if let Some(name) = config::get_setting(&app, &format!("name:{}", path)) {
+            result.insert(path, name);
+        }
+    }
+    result
+}
+
+#[tauri::command]
+fn get_custom_motions(app: tauri::AppHandle, path: String) -> Option<String> {
+    config::get_setting(&app, &format!("motions:{}", path))
 }
 
 #[tauri::command]

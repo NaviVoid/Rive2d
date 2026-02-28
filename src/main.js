@@ -61,6 +61,8 @@ let showBorder = false;
 let tapMotion = true;
 let showHitAreas = false;
 let lockModel = false;
+let hitMotionMap = {};
+let currentModelPath = null;
 let dragging = false;
 let dragMoved = false;
 let dragStart = { x: 0, y: 0 };
@@ -175,6 +177,23 @@ listen('load-model', async (event) => {
 listen('reset-position', async () => {
   await ready;
   resetModelPosition();
+});
+
+listen('motions-changed', async (event) => {
+  const changedPath = event.payload;
+  if (!currentModel || changedPath !== currentModelPath) return;
+  // Rebuild hitMotionMap from model defaults + new custom overrides
+  const rawJson = currentModel.internalModel.settings.json;
+  const rawHitAreas = rawJson.HitAreas || rawJson.hitAreas || rawJson.hit_areas || [];
+  hitMotionMap = {};
+  for (const h of rawHitAreas) {
+    const n = h.Name || h.name;
+    if (n && h.Motion) hitMotionMap[n] = h.Motion;
+  }
+  try {
+    const customJson = await invoke('get_custom_motions', { path: changedPath });
+    if (customJson) Object.assign(hitMotionMap, JSON.parse(customJson));
+  } catch {}
 });
 
 listen('setting-changed', (event) => {
@@ -447,22 +466,33 @@ async function loadModel(modelPath) {
     // engine's normalizeHitAreaDefs drops the Motion field.
     const rawJson = model.internalModel.settings.json;
     const rawHitAreas = rawJson.HitAreas || rawJson.hitAreas || rawJson.hit_areas || [];
-    const hitMotionMap = {};
+    hitMotionMap = {};
     for (const h of rawHitAreas) {
       const n = h.Name || h.name;
       if (n && h.Motion) hitMotionMap[n] = h.Motion;
     }
 
+    // Load custom motion overrides from settings
+    currentModelPath = modelPath.replace('model://localhost/', '');
+    try {
+      const customJson = await invoke('get_custom_motions', { path: currentModelPath });
+      if (customJson) Object.assign(hitMotionMap, JSON.parse(customJson));
+    } catch {}
+
     model.on('pointertap', (e) => {
       if (!tapMotion || dragMoved) return;
       const hitAreaNames = model.hitTest(e.global.x, e.global.y);
       for (const name of hitAreaNames) {
-        // Explicit Motion field from model JSON (e.g. "touchidle:1")
         const mapped = hitMotionMap[name];
+        // Custom override: __none__ means do nothing
+        if (mapped === '__none__') continue;
+        // Explicit mapping (from model JSON or custom override)
         if (mapped) {
           const [group, idx] = mapped.split(':');
           model.motion(group, idx !== undefined ? parseInt(idx) : undefined);
+          continue;
         }
+        // Convention fallbacks (only when no explicit mapping)
         // Cubism 2: hit area "body" → motion "tap_body"
         model.motion('tap_' + name);
         // Direct: name as motion group
