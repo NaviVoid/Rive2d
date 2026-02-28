@@ -443,16 +443,33 @@ async function loadModel(modelPath) {
     });
 
     // Tap to trigger motions (gated by tapMotion toggle)
-    // Uses pointertap directly — fires on click without drag movement.
-    // Tries multiple motion group naming conventions:
-    //   Cubism 2: hit area "body" → motion "tap_body"
-    //   Cubism 3/4: hit area "TouchBody" → motion "body"
+    // Build hit area → Motion field map from raw model JSON, since the
+    // engine's normalizeHitAreaDefs drops the Motion field.
+    const rawJson = model.internalModel.settings.json;
+    const rawHitAreas = rawJson.HitAreas || rawJson.hitAreas || rawJson.hit_areas || [];
+    const hitMotionMap = {};
+    for (const h of rawHitAreas) {
+      const n = h.Name || h.name;
+      if (n && h.Motion) hitMotionMap[n] = h.Motion;
+    }
+
     model.on('pointertap', (e) => {
       if (!tapMotion || dragMoved) return;
       const hitAreaNames = model.hitTest(e.global.x, e.global.y);
       for (const name of hitAreaNames) {
+        // Explicit Motion field from model JSON (e.g. "touchidle:1")
+        const mapped = hitMotionMap[name];
+        if (mapped) {
+          const [group, idx] = mapped.split(':');
+          model.motion(group, idx !== undefined ? parseInt(idx) : undefined);
+        }
+        // Cubism 2: hit area "body" → motion "tap_body"
         model.motion('tap_' + name);
+        // Direct: name as motion group
         model.motion(name);
+        // Cubism 3/4: hit area "摸头" → motion "Tap摸头"
+        model.motion('Tap' + name);
+        // Strip "Touch" prefix: "TouchBody" → "body"
         const stripped = name.replace(/^Touch/i, '');
         if (stripped !== name) {
           model.motion(stripped.toLowerCase());
