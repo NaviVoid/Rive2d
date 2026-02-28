@@ -72,6 +72,7 @@ let dragMoved = false;
 let dragStart = { x: 0, y: 0 };
 let dragOffset = { x: 0, y: 0 };
 const DRAG_THRESHOLD = 4; // px — ignore micro-movements for tap detection
+let playingStart = false;     // true while start animation is playing
 let paramHitItems = [];      // ParamHit controller items parsed from model JSON
 let paramDragging = null;    // { item, startPos, paramIndex, startValue, currentValue }
 let paramReleaseAnims = [];  // parameter reset animations after drag release
@@ -248,6 +249,7 @@ listen('unload-model', async () => {
     motionNameToIndex = {};
     motionNextMap = {};
     pendingNextMtn = null;
+    playingStart = false;
     paramHitItems = [];
     paramDragging = null;
     paramReleaseAnims = [];
@@ -575,6 +577,7 @@ async function loadModel(modelPath) {
   // Reset drag state so stale flags don't block taps on the new model
   dragging = false;
   dragMoved = false;
+  playingStart = false;
   paramDragging = null;
   paramReleaseAnims = [];
   paramHitItems = [];
@@ -733,6 +736,7 @@ async function loadModel(modelPath) {
 
     // NextMtn chaining: when a motion finishes, play its NextMtn if set
     model.internalModel.motionManager.on('motionFinish', () => {
+      playingStart = false;
       if (pendingNextMtn) {
         const mtn = pendingNextMtn;
         pendingNextMtn = null;
@@ -743,6 +747,11 @@ async function loadModel(modelPath) {
     });
 
     model.on('pointertap', (e) => {
+      if (playingStart) {
+        playingStart = false;
+        model.internalModel.motionManager.stopAllMotions();
+        return;
+      }
       if (!tapMotion || dragMoved) return;
       const hitAreaNames = model.hitTest(e.global.x, e.global.y);
       for (const name of hitAreaNames) {
@@ -799,6 +808,7 @@ async function loadModel(modelPath) {
     const motions = rawJson.FileReferences?.Motions || rawJson.motions || {};
     const startGroup = motions['Start'] ? 'Start' : motions['start'] ? 'start' : null;
     if (startGroup) {
+      playingStart = true;
       model.motion(startGroup, 0, 1); // priority IDLE so taps can interrupt
     }
   } catch (err) {
