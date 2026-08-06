@@ -1,10 +1,13 @@
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
 
 /// Manifest file name inside LPK archives
 const MANIFEST_NAME: &str = "config.mlve";
+const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_ENTRY_SIZE: u64 = 256 * 1024 * 1024;
+const MAX_TOTAL_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Extract an LPK file to `dest_dir`, returning the path to the .model3.json/.model.json.
 ///
@@ -19,6 +22,7 @@ pub fn extract_lpk(dest_dir: &Path, lpk_path: &str) -> Result<String, String> {
 
     let file = std::fs::File::open(lpk_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    validate_archive(&mut archive)?;
 
     // Try to find the manifest (config.mlve or its MD5-hashed name)
     let manifest = read_manifest(&mut archive);
@@ -143,14 +147,12 @@ fn extract_encrypted_lpk(
         // Check if this is an encrypted entry (32 hex chars + .bin3 or .bin)
         let is_encrypted_entry = is_hashed_entry(entry_name);
 
-        let data = read_archive_entry(archive, entry_name)?;
+        let mut data = read_archive_entry(archive, entry_name)?;
 
-        let data = if is_encrypted && is_encrypted_entry {
+        if is_encrypted && is_encrypted_entry {
             let key = derive_key(model_id, &ext_config, entry_name, is_stm);
-            decrypt_lcg_xor(&data, key)
-        } else {
-            data
-        };
+            decrypt_lcg_xor(&mut data, key);
+        }
 
         // Determine output filename based on file type detection
         let out_name = if is_encrypted_entry {
@@ -223,6 +225,33 @@ fn extract_encrypted_lpk(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn validate_archive<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<(), String> {
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return Err(format!(
+            "Archive contains too many entries (maximum {})",
+            MAX_ARCHIVE_ENTRIES
+        ));
+    }
+
+    let mut total_size = 0u64;
+    for index in 0..archive.len() {
+        let file = archive.by_index(index).map_err(|e| e.to_string())?;
+        if file.enclosed_name().is_none() {
+            return Err(format!("Unsafe archive path: {}", file.name()));
+        }
+        if file.size() > MAX_ENTRY_SIZE {
+            return Err(format!("Archive entry is too large: {}", file.name()));
+        }
+        total_size = total_size
+            .checked_add(file.size())
+            .ok_or("Archive size overflow")?;
+        if total_size > MAX_TOTAL_SIZE {
+            return Err("Archive uncompressed size is too large".to_string());
+        }
+    }
+    Ok(())
+}
 
 /// Check if a ZIP entry name looks like an encrypted file (32 hex chars + .bin3 or .bin)
 fn is_hashed_entry(name: &str) -> bool {
@@ -339,12 +368,19 @@ fn read_archive_entry(
     archive: &mut zip::ZipArchive<std::fs::File>,
     name: &str,
 ) -> Result<Vec<u8>, String> {
-    let mut file = archive
+    let file = archive
         .by_name(name)
         .map_err(|e| format!("{}: {}", name, e))?;
+    if file.size() > MAX_ENTRY_SIZE {
+        return Err(format!("Archive entry is too large: {}", name));
+    }
     let mut data = Vec::with_capacity(file.size() as usize);
-    file.read_to_end(&mut data)
+    file.take(MAX_ENTRY_SIZE + 1)
+        .read_to_end(&mut data)
         .map_err(|e| format!("Failed to read {}: {}", name, e))?;
+    if data.len() as u64 > MAX_ENTRY_SIZE {
+        return Err(format!("Archive entry is too large: {}", name));
+    }
     Ok(data)
 }
 
@@ -392,16 +428,14 @@ fn java_hash_code(s: &str) -> i64 {
 ///   state = (65535 & ((2531011 + 214013 * state) >> 16))
 ///   byte ^= state & 0xFF
 /// State resets to `key` at the start of every 1024-byte chunk.
-fn decrypt_lcg_xor(data: &[u8], key: i64) -> Vec<u8> {
-    let mut result = Vec::with_capacity(data.len());
-    for chunk in data.chunks(1024) {
+fn decrypt_lcg_xor(data: &mut [u8], key: i64) {
+    for chunk in data.chunks_mut(1024) {
         let mut k = key;
-        for &byte in chunk {
+        for byte in chunk {
             k = (65535 & ((2531011 + 214013 * k) >> 16)) & 0xFFFFFFFF;
-            result.push((k as u8) ^ byte);
+            *byte ^= k as u8;
         }
     }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -440,10 +474,48 @@ mod tests {
     #[test]
     fn test_decrypt_roundtrip() {
         let original = b"Hello, Live2D!";
+        let mut data = original.to_vec();
         let key = java_hash_code("test_key");
-        let encrypted = decrypt_lcg_xor(original, key);
-        let decrypted = decrypt_lcg_xor(&encrypted, key);
-        assert_eq!(decrypted, original);
+        decrypt_lcg_xor(&mut data, key);
+        decrypt_lcg_xor(&mut data, key);
+        assert_eq!(data, original);
+    }
+
+    #[test]
+    fn encrypted_lpk_cannot_escape_destination() {
+        use std::io::Write;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let root = std::env::temp_dir().join(format!(
+            "rive2d-lpk-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let archive_path = root.join("malicious.lpk");
+        let dest = root.join("model");
+        let escaped = root.join("escaped.txt");
+
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        writer
+            .start_file(MANIFEST_NAME, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer
+            .write_all(br#"{"type":"STD_1_0","encrypt":"true","list":[]}"#)
+            .unwrap();
+        writer
+            .start_file("../escaped.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"malicious").unwrap();
+        writer.finish().unwrap();
+
+        let error = extract_lpk(&dest, archive_path.to_str().unwrap()).unwrap_err();
+        assert!(error.starts_with("Unsafe archive path:"));
+        assert!(!escaped.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
