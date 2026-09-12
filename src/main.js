@@ -1,9 +1,10 @@
 import * as PIXI from 'pixi.js';
 import { Assets } from 'pixi.js';
-import { Live2DModel, SoundManager } from 'untitled-pixi-live2d-engine';
+import { Live2DModel, Live2DPlugin, SoundManager } from 'untitled-pixi-live2d-engine';
 
 // Expose PIXI globally for pixi-live2d-display
 window.PIXI = PIXI;
+PIXI.extensions.add(Live2DPlugin);
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -1201,6 +1202,7 @@ function checkLeaveTimers() {
 function handleParamHitRelease() {
   const { item, paramIndex, currentValue, startValue } = paramDragging;
   if (dragMoved) {
+    console.log(`[touch] ParamHit release on ${item.hitArea}: value=${currentValue.toFixed(3)}, start=${startValue.toFixed(3)}`);
     if (item.maxMtn || item.minMtn) {
       const coreModel = currentModel.internalModel.coreModel;
       const max = paramIndex >= 0 ? coreModel.getParameterMaximumValue(paramIndex) : 1;
