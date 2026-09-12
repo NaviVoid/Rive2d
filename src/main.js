@@ -80,6 +80,7 @@ let playingStart = false;     // true while start animation is playing
 let paramHitItems = [];      // ParamHit controller items parsed from model JSON
 let paramDragging = null;    // { hitArea, items: [{ item, startPos, paramIndex, startValue, currentValue }], hasMoved }
 let paramReleaseAnims = [];  // parameter reset animations after drag release
+let paramHitLocks = {};      // { paramIndex: { value } } — persistent ParamHit locks
 let paramLoopItems = [];     // ParamLoop controller items: auto-oscillating parameters
 let dragHitNames = [];       // hit area names recorded on pointerdown for drag-motion detection
 let modelMotions = {};       // normalized motion groups from model metadata
@@ -153,7 +154,6 @@ const ready = app.init({
     if (paramDragging && currentModel) {
       if (!paramDragging.hasMoved) {
         paramDragging.hasMoved = true;
-        triggerParamHitMotions(paramDragging.items, 'beginMtn', 'BeginMtn');
       }
       const dx = e.global.x - dragStart.x;
       const dy = e.global.y - dragStart.y;
@@ -163,14 +163,15 @@ const ready = app.init({
       const scale = currentModel?.scale.x || 1;
       const coreModel = currentModel.internalModel.coreModel;
       for (const state of paramDragging.items) {
-        const { item, startPos, startValue, paramIndex } = state;
+        const { item, startValue, paramIndex } = state;
         const currentPos = item.axis === 0 ? e.global.x : e.global.y;
-        const value = startValue + (currentPos - startPos) * item.factor * scale;
-        const modelMin = coreModel.getParameterMinimumValue(paramIndex);
-        const modelMax = coreModel.getParameterMaximumValue(paramIndex);
-        const min = Number.isFinite(item.minValue) ? Math.max(modelMin, item.minValue) : modelMin;
-        const max = Number.isFinite(item.maxValue) ? Math.min(modelMax, item.maxValue) : modelMax;
-        state.currentValue = Math.max(min, Math.min(max, value));
+        const delta = currentPos - state.lastPos;
+        state.lastPos = currentPos;
+        if (item.type === 2) continue;
+        const value = item.type === 1
+          ? state.targetValue + Math.abs(delta) * item.factor * scale
+          : startValue + (currentPos - state.startPos) * item.factor * scale;
+        updateParamHitState(state, value, coreModel);
       }
       return;
     }
@@ -208,6 +209,16 @@ const ready = app.init({
     if (dragging && currentModel) {
       handleDragRelease(e);
       return;
+    }
+  });
+
+  app.stage.on('pointercancel', () => {
+    if (paramDragging && currentModel) {
+      handleParamHitRelease();
+      return;
+    }
+    if (dragging && currentModel) {
+      handleDragRelease();
     }
   });
 
@@ -326,6 +337,7 @@ listen('unload-model', async () => {
     paramHitItems = [];
     paramDragging = null;
     paramReleaseAnims = [];
+    paramHitLocks = {};
     paramLoopItems = [];
     dragHitNames = [];
     modelMotions = {};
@@ -410,6 +422,56 @@ function setFullInputRegion() {
     width: window.innerWidth,
     height: window.innerHeight,
   }).catch(() => {});
+}
+
+function getParamHitBounds(item, coreModel, paramIndex) {
+  const modelMin = coreModel.getParameterMinimumValue(paramIndex);
+  const modelMax = coreModel.getParameterMaximumValue(paramIndex);
+  return {
+    min: Number.isFinite(item.minValue) ? Math.max(modelMin, item.minValue) : modelMin,
+    max: Number.isFinite(item.maxValue) ? Math.min(modelMax, item.maxValue) : modelMax,
+  };
+}
+
+function updateParamHitState(state, value, coreModel) {
+  const { item, startValue, paramIndex } = state;
+  const { min, max } = getParamHitBounds(item, coreModel, paramIndex);
+  const previousValue = state.currentValue;
+  state.targetValue = Math.max(min, Math.min(max, value));
+  state.currentValue = Math.max(
+    min,
+    Math.min(max, startValue + (state.targetValue - startValue) * item.weight),
+  );
+
+  // Boundary actions fire when the value reaches a limit, not when the
+  // pointer is released. Reset the latch after moving away so a later
+  // crossing can fire again during the same interaction.
+  if (previousValue < max && state.currentValue >= max) {
+    if (item.maxMtn) triggerParamHitMotions([state], 'maxMtn', 'MaxMtn');
+    state.maxReached = true;
+  } else if (state.currentValue < max) {
+    state.maxReached = false;
+  }
+  if (previousValue > min && state.currentValue <= min) {
+    if (item.minMtn) triggerParamHitMotions([state], 'minMtn', 'MinMtn');
+    state.minReached = true;
+  } else if (state.currentValue > min) {
+    state.minReached = false;
+  }
+}
+
+function applyReleaseCurve(progress, releaseType) {
+  const t = Math.max(0, Math.min(1, progress));
+  switch (Number(releaseType)) {
+    case 1: // Slow Out
+      return 1 - (1 - t) ** 2;
+    case 2: // Fast Out
+      return t ** 2;
+    case 3: // Ease In Out
+      return t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2;
+    default: // Linear
+      return t;
+  }
 }
 
 // --- Border drawing ---
@@ -605,6 +667,11 @@ function firstValue(object, ...keys) {
   return undefined;
 }
 
+function finiteNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
 function normalizedControllerName(name) {
   const compact = name.toLowerCase().replaceAll('_', '');
   const names = {
@@ -634,6 +701,7 @@ function normalizeControllerItem(item) {
     Input: ['Input', 'input'], DownMtn: ['DownMtn', 'downMtn', 'down_mtn'],
     Motion: ['Motion', 'motion'], Direction: ['Direction', 'direction'],
     Value: ['Value', 'value'], Duration: ['Duration', 'duration'], Type: ['Type', 'type'],
+    Weight: ['Weight', 'weight'], LowPriority: ['LowPriority', 'lowPriority', 'low_priority'],
     BlendMode: ['BlendMode', 'blendMode', 'blend_mode'], Lock: ['Lock', 'lock'],
     Enabled: ['Enabled', 'enabled'],
   };
@@ -1274,41 +1342,44 @@ function triggerParamHitMotions(states, property, label) {
 function handleParamHitRelease() {
   if (!paramDragging || !currentModel) return;
   const { hitArea, items } = paramDragging;
-  if (paramDragging.hasMoved) {
-    const coreModel = currentModel.internalModel.coreModel;
-    const maxMotions = new Set();
-    const minMotions = new Set();
-    for (const state of items) {
-      const { item, paramIndex, currentValue, startValue } = state;
-      const modelMax = coreModel.getParameterMaximumValue(paramIndex);
-      const modelMin = coreModel.getParameterMinimumValue(paramIndex);
-      const max = Number.isFinite(item.maxValue) ? item.maxValue : modelMax;
-      const min = Number.isFinite(item.minValue) ? item.minValue : modelMin;
-      const moved = Math.abs(currentValue - startValue);
-      console.log(`[touch] ParamHit release on ${hitArea}: ${item.paramId}=${currentValue.toFixed(3)}, moved=${moved.toFixed(3)}, range=[${min},${max}]`);
-      if (moved > Number.EPSILON && item.maxMtn && currentValue >= max) maxMotions.add(item.maxMtn);
-      if (moved > Number.EPSILON && item.minMtn && currentValue <= min) minMotions.add(item.minMtn);
-      if (item.releaseType === 0 || item.releaseType === 1) {
-        const speed = item.releaseDuration > 0 ? 1 / (item.releaseDuration / 16.67) : 0.05;
-        paramReleaseAnims.push({
-          paramIndex,
-          from: currentValue,
-          target: startValue,
-          speed,
-          t: 0,
-        });
-      }
+  const coreModel = currentModel.internalModel.coreModel;
+  const endStates = [];
+  for (const state of items) {
+    const { item, paramIndex, currentValue, startValue } = state;
+    const { min, max } = getParamHitBounds(item, coreModel, paramIndex);
+    const moved = Math.abs(currentValue - startValue);
+    console.log(`[touch] ParamHit release on ${hitArea}: ${item.paramId}=${currentValue.toFixed(3)}, moved=${moved.toFixed(3)}, range=[${min},${max}]`);
+
+    // LockParam is the persistence switch. ReleaseType is only metadata for
+    // the return curve and must not decide whether a return happens.
+    if (item.lockParam) {
+      paramReleaseAnims = paramReleaseAnims.filter(anim => anim.paramIndex !== paramIndex);
+      paramHitLocks[paramIndex] = { value: currentValue };
+    } else {
+      delete paramHitLocks[paramIndex];
+      const speed = item.releaseDuration > 0 ? 1 / (item.releaseDuration / 16.67) : 0.05;
+      paramReleaseAnims.push({
+        paramIndex,
+        from: currentValue,
+        target: startValue,
+        releaseType: item.releaseType,
+        speed,
+        t: 0,
+      });
     }
-    for (const ref of maxMotions) playMotionRef(ref);
-    for (const ref of minMotions) playMotionRef(ref);
-    triggerParamHitMotions(items, 'endMtn', 'EndMtn');
+
+    // EndMtn is the non-boundary release action. A MaxMtn crossing already
+    // consumed the interaction and must not also run EndMtn.
+    if (!state.maxReached && !state.minReached && item.endMtn) endStates.push(state);
   }
+  triggerParamHitMotions(endStates, 'endMtn', 'EndMtn');
   paramDragging = null;
   updateInputRegion();
 }
 
 function handleDragRelease() {
   dragging = false;
+  dragHitNames = [];
   if (!lockModel) savePosition();
   updateInputRegion();
 }
@@ -1322,6 +1393,7 @@ async function loadModel(modelPath) {
   playingStart = false;
   paramDragging = null;
   paramReleaseAnims = [];
+  paramHitLocks = {};
   paramHitItems = [];
   paramLoopItems = [];
   // Reset feature state
@@ -1427,12 +1499,19 @@ async function loadModel(modelPath) {
               hitArea: name,
               items: items.map(item => {
                 const startValue = coreModel.getParameterValueByIndex(item.paramIndex);
+                delete paramHitLocks[item.paramIndex];
                 return {
                   item,
                   startPos: item.axis === 0 ? e.global.x : e.global.y,
+                  lastPos: item.axis === 0 ? e.global.x : e.global.y,
                   paramIndex: item.paramIndex,
                   startValue,
                   currentValue: startValue,
+                  targetValue: startValue,
+                  pressStartTime: performance.now(),
+                  lastUpdateTime: performance.now(),
+                  maxReached: false,
+                  minReached: false,
                 };
               }),
               hasMoved: false,
@@ -1443,6 +1522,7 @@ async function loadModel(modelPath) {
             dragStart.x = e.global.x;
             dragStart.y = e.global.y;
             setFullInputRegion();
+            triggerParamHitMotions(paramDragging.items, 'beginMtn', 'BeginMtn');
             return;
           }
         }
@@ -1452,9 +1532,7 @@ async function loadModel(modelPath) {
       dragHitNames = sortHitNames(model.hitTest(e.global.x, e.global.y));
       dragStart.x = e.global.x;
       dragStart.y = e.global.y;
-      if (tapMotion) {
-        triggerDragMotions();
-      }
+      triggerDragMotions();
 
       console.log(`[touch] pointerdown — drag hit areas: [${dragHitNames.join(', ')}]`);
       dragging = true;
@@ -1505,12 +1583,14 @@ async function loadModel(modelPath) {
           hitArea: item.HitArea,
           paramId,
           paramIndex, // -1 if parameter doesn't exist in moc3
-          axis: item.Axis ?? 0,
-          factor: item.Factor ?? 0.04,
+          axis: finiteNumber(item.Axis, 0),
+          factor: finiteNumber(item.Factor, 0.04),
+          type: finiteNumber(item.Type, 0),
+          weight: finiteNumber(item.Weight, 1),
           minValue: item.MinValue,
           maxValue: item.MaxValue,
-          releaseType: item.ReleaseType ?? 0,
-          releaseDuration: item.Release ?? 500,
+          releaseType: finiteNumber(item.ReleaseType, 0),
+          releaseDuration: finiteNumber(item.Release, 500),
           lockParam: item.LockParam ?? false,
           maxMtn: item.MaxMtn ? resolveMaxMtn(item.MaxMtn) : null,
           minMtn: item.MinMtn ? resolveMotionRef(item.MinMtn) : null,
@@ -1666,16 +1746,35 @@ async function loadModel(modelPath) {
       origMotionUpdate.apply(this, args);
       const cm = model.internalModel.coreModel;
       if (paramDragging) {
+        const now = performance.now();
         for (const state of paramDragging.items) {
+          if (state.item.type === 2) {
+            const elapsed = Math.max(0, now - state.lastUpdateTime) / 1000;
+            state.lastUpdateTime = now;
+            if (elapsed > 0) {
+              paramDragging.hasMoved = true;
+              updateParamHitState(
+                state,
+                state.targetValue + state.item.factor * elapsed,
+                cm,
+              );
+            }
+          }
           cm.setParameterValueByIndex(state.paramIndex, state.currentValue);
         }
       }
       for (const anim of paramReleaseAnims) {
         anim.t = Math.min(1, anim.t + (anim.speed || 0.05));
-        const v = anim.from + (anim.target - anim.from) * anim.t;
+        const v = anim.from + (anim.target - anim.from) * applyReleaseCurve(anim.t, anim.releaseType);
         cm.setParameterValueByIndex(anim.paramIndex, v);
       }
       paramReleaseAnims = paramReleaseAnims.filter(a => a.t < 1);
+
+      // ParamHit LockParam persists after pointer release and must win over
+      // idle motions, physics inputs, and other controller writes.
+      for (const [paramIndex, lock] of Object.entries(paramHitLocks)) {
+        cm.setParameterValueByIndex(Number(paramIndex), lock.value);
+      }
 
       // Enforce locked params (from commands + ParamValue controller)
       const nowMs = performance.now();
@@ -1819,11 +1918,12 @@ async function loadModel(modelPath) {
       if (hitAreaNames.length === 0) {
         console.log('[touch] pointertap — no hit area at click position');
       }
+      const dragHitName = hitAreaNames.find(name => isDragHitArea(name));
+      if (dragHitName) {
+        console.log(`[touch] ${dragHitName}: skipped (drag hit area consumed tap)`);
+        return;
+      }
       for (const name of hitAreaNames) {
-        if (isDragHitArea(name)) {
-          console.log(`[touch] ${name}: skipped (drag hit area)`);
-          continue;
-        }
         const mapped = hitMotionMap[name];
         // Custom override: __none__ means do nothing
         if (mapped === '__none__') { console.log(`[touch] ${name}: skipped (__none__)`); continue; }

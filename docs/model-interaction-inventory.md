@@ -385,17 +385,10 @@ pointerdown; it executes once from `pointertap` instead.
 
 ## Known Runtime Gaps
 
-This document records the target semantics; it is not a claim that the current
-runtime already implements every field correctly.
+This document records the target semantics and the remaining implementation
+gap:
 
-- `src/main.js` currently treats `ReleaseType` values `0` and `1` as a command
-  to restore the parameter. The JSON Editor definition makes `ReleaseType` a
-  return-curve selector; `LockParam` must decide whether the value is kept.
-- `src/main.js` parses `LockParam`, but the release path does not yet honor it
-  before starting a parameter return animation.
-- `Type`, `Weight`, and `LowPriority` are not fully applied by the `ParamHit`
-  runtime path.
-- `MaxMtn` and `MinMtn` should react when the parameter reaches a boundary,
-  not only when the pointer is released.
-- `EndMtn` should follow its documented release condition instead of being
-  unconditionally executed for every moved `ParamHit`.
+- `LowPriority` is parsed from model metadata but is not yet used to adjust
+  the priority of a `ParamHit` action motion.
+- Screen-boundary clamping for ordinary model position dragging is separate
+  from `ParamHit` parameter limits and remains a runtime policy to implement.
