@@ -163,7 +163,7 @@ const ready = app.init({
         if (paramDragging.item.beginMtn) {
           const [g, idx] = paramDragging.item.beginMtn.split(':');
           console.log(`[motion] drag BeginMtn on ${paramDragging.item.hitArea}: ${g}` + (idx !== undefined ? `:${idx}` : ''));
-          currentModel.motion(g, idx !== undefined ? parseInt(idx) : undefined);
+          playMotionRef(paramDragging.item.beginMtn);
         }
       }
       const { item, startPos, startValue } = paramDragging;
@@ -187,7 +187,7 @@ const ready = app.init({
             dragScrubState.beginFired = true;
             const [g, idx] = item.beginMtn.split(':');
             console.log(`[motion] drag scrub BeginMtn on ${item.hitArea}: ${g}` + (idx !== undefined ? `:${idx}` : ''));
-            currentModel.motion(g, idx !== undefined ? parseInt(idx) : undefined);
+            playMotionRef(item.beginMtn);
           }
         }
         const delta = item.axis === 0 ? (e.global.x - dragStart.x) : (e.global.y - dragStart.y);
@@ -659,6 +659,13 @@ function resolveMotionRef(ref) {
     return group + ':' + motionNameToIndex[group][name];
   }
   return ref;
+}
+
+function playMotionRef(ref, priority) {
+  if (!ref) return;
+  const resolved = resolveMotionRef(ref);
+  const [group, idxStr] = resolved.split(':');
+  playMotion(group, idxStr !== undefined ? parseInt(idxStr) : undefined, priority);
 }
 
 // Build hitMotionMap and hitAreaOrder from raw hit areas + optional custom overrides JSON
@@ -1217,13 +1224,13 @@ function handleParamHitRelease() {
         if (item.maxMtn && atMax) {
           const [group, idxStr] = item.maxMtn.split(':');
           console.log(`[motion] drag MaxMtn on ${item.hitArea}: ${group}` + (idxStr !== undefined ? `:${idxStr}` : ''));
-          currentModel.motion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
+          playMotionRef(item.maxMtn);
         }
         // MinMtn: triggered when parameter reaches min (legacy format)
         if (item.minMtn && atMin) {
           const [group, idxStr] = item.minMtn.split(':');
           console.log(`[motion] drag MinMtn on ${item.hitArea}: ${group}` + (idxStr !== undefined ? `:${idxStr}` : ''));
-          currentModel.motion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
+          playMotionRef(item.minMtn);
         }
       }
     }
@@ -1231,7 +1238,7 @@ function handleParamHitRelease() {
     if (item.endMtn) {
       const [group, idxStr] = item.endMtn.split(':');
       console.log(`[motion] drag EndMtn on ${item.hitArea}: ${group}` + (idxStr !== undefined ? `:${idxStr}` : ''));
-      currentModel.motion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
+      playMotionRef(item.endMtn);
     }
     // ReleaseType 0 and 1: spring back to default value
     // ReleaseType 2 and 3: stay at current value (sticky/persistent)
@@ -1288,7 +1295,7 @@ function handleDragRelease(e) {
     if (dragScrubState.item?.endMtn) {
       const [group, idxStr] = dragScrubState.item.endMtn.split(':');
       console.log(`[motion] drag scrub EndMtn on ${dragScrubState.hitArea}: ${group}` + (idxStr !== undefined ? `:${idxStr}` : ''));
-      currentModel.motion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
+      playMotionRef(dragScrubState.item.endMtn);
     }
     dragScrubState = null;
     dragging = false;
