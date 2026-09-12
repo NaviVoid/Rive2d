@@ -560,8 +560,9 @@ button {
   flex-direction: column;
   gap: 8px;
   overflow-y: auto;
-  flex: 1;
+  flex: 1 1 auto;
   min-height: 0;
+  overscroll-behavior: contain;
 }
 
 .model-card {
@@ -573,6 +574,7 @@ button {
   border-radius: 10px;
   transition: border-color 0.2s;
   gap: 16px;
+  flex-shrink: 0;
 }
 
 .model-preview {
