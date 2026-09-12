@@ -50,7 +50,7 @@ click mapping and it is not, by itself, a request to play a motion file.
 | `Release` | Duration used when the parameter is released and configured to return. |
 | `ReleaseType` | Release/interpolation curve selection. It does not mean “restore” versus “keep”. |
 | `BeginMtn` | Motion/action associated with beginning the parameter interaction, when present. |
-| `MaxMtn` / `MinMtn` | Motion/action associated with reaching the configured maximum/minimum. |
+| `MaxMtn` / `MinMtn` | Motion/action route associated with reaching the configured maximum/minimum. The route may be an `Option` that changes state with `VarFloats` before starting an `Action`. |
 | `EndMtn` | Motion/action associated with releasing the interaction without reaching the parameter's maximum value. |
 
 The release decision must therefore be interpreted in this order:
@@ -161,8 +161,8 @@ An entry without `File` but with `Command`, `VarFloats`, text, or choices is a c
 
 Execution:
 
-1. Execute `Command`.
-2. Apply `VarFloats` actions.
+1. Apply `VarFloats` actions.
+2. Execute `Command`.
 3. Apply text/intimacy effects.
 4. Apply `PostCommand` immediately because there is no motion-finish event.
 5. Follow `NextMtn` immediately if present.
@@ -202,6 +202,12 @@ The imported library uses these `VarFloats` condition operators:
 These conditions are state gates, not errors. For example, a model may let a
 `TouchIdle1` action assign `idle = 1`, then intentionally reject `Tap` entries
 whose condition is `idle equal 0` until the state changes back.
+
+State-switching drag routes must preserve the complete reference chain. For
+example, `TouchIdle1.MaxMtn: "Option:touch_idle1"` applies
+`status = 1`, then starts `Action:touch_idle1`; after that action finishes,
+the eligible `Idle` entry is `Idle:1`. `TouchIdle.MaxMtn` performs the
+corresponding transition back to `status = 0` and `Idle:0`.
 
 ## Click and Pointer Event Categories
 

@@ -10,13 +10,32 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
 // Forward console logs to backend log file
+const logStartedAt = performance.now();
+let logSequence = 0;
+
+function formatLogValue(value) {
+  if (typeof value !== 'object' || value === null) return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '[unserializable]';
+  }
+}
+
 for (const level of ['log', 'warn', 'error']) {
   const orig = console[level];
   console[level] = (...args) => {
-    orig.apply(console, args);
-    const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+    const elapsed = (performance.now() - logStartedAt).toFixed(1).padStart(9, ' ');
+    const stamp = `[${new Date().toISOString()} +${elapsed}ms #${String(++logSequence).padStart(5, '0')}]`;
+    orig.apply(console, [stamp, ...args]);
+    const msg = [stamp, ...args].map(formatLogValue).join(' ');
     invoke('js_log', { level, msg }).catch(() => {});
   };
+}
+
+function traceLog(scope, event, details = undefined) {
+  const suffix = details === undefined ? '' : ` ${formatLogValue(details)}`;
+  console.log(`[trace:${scope}] ${event}${suffix}`);
 }
 window.addEventListener('error', (e) => {
   invoke('js_log', { level: 'error', msg: `${e.message} at ${e.filename}:${e.lineno}:${e.colno}` }).catch(() => {});
@@ -76,6 +95,10 @@ let dragMoved = false;
 let dragStart = { x: 0, y: 0 };
 let dragOffset = { x: 0, y: 0 };
 const DRAG_THRESHOLD = 4; // px — ignore micro-movements for tap detection
+let interactionSequence = 0;
+let dragInteractionId = null;
+let lastInteractionId = null;
+let motionRequestSequence = 0;
 let playingStart = false;     // true while start animation is playing
 let paramHitItems = [];      // ParamHit controller items parsed from model JSON
 let paramDragging = null;    // { hitArea, items: [{ item, startPos, paramIndex, startValue, currentValue }], hasMoved }
@@ -152,6 +175,7 @@ const ready = app.init({
   app.stage.on('pointermove', (e) => {
     // ParamHit drag — control a Live2D parameter
     if (paramDragging && currentModel) {
+      const now = performance.now();
       if (!paramDragging.hasMoved) {
         paramDragging.hasMoved = true;
       }
@@ -172,6 +196,22 @@ const ready = app.init({
           : startValue + (currentPos - state.startPos) * item.factor;
         updateParamHitState(state, value, coreModel);
       }
+      if (now - paramDragging.lastTraceAt >= 100) {
+        traceLog('touch', 'param-move', {
+          interactionId: paramDragging.interactionId,
+          pointerId: paramDragging.pointerId,
+          hitArea: paramDragging.hitArea,
+          x: Number(e.global.x.toFixed(1)),
+          y: Number(e.global.y.toFixed(1)),
+          values: paramDragging.items.map(state => ({
+            param: state.item.paramId,
+            value: Number(state.currentValue.toFixed(3)),
+            minReached: state.minReached,
+            maxReached: state.maxReached,
+          })),
+        });
+        paramDragging.lastTraceAt = now;
+      }
       return;
     }
     // Model drag — move position + trigger drag motions
@@ -181,6 +221,12 @@ const ready = app.init({
       const dy = e.global.y - dragStart.y;
       if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;
       dragMoved = true;
+      traceLog('touch', 'model-drag-threshold', {
+        interactionId: dragInteractionId,
+        pointerId: e.pointerId,
+        threshold: DRAG_THRESHOLD,
+        distance: Number(Math.hypot(dx, dy).toFixed(1)),
+      });
     }
     // lockModel only prevents position changes, not drag motions
     if (lockModel) return;
@@ -192,33 +238,33 @@ const ready = app.init({
 
   app.stage.on('pointerup', (e) => {
     if (paramDragging && currentModel) {
-      handleParamHitRelease();
+      handleParamHitRelease('pointerup');
       return;
     }
     if (dragging && currentModel) {
-      handleDragRelease(e);
+      handleDragRelease(e, 'pointerup');
       return;
     }
   });
 
   app.stage.on('pointerupoutside', (e) => {
     if (paramDragging && currentModel) {
-      handleParamHitRelease();
+      handleParamHitRelease('pointerupoutside');
       return;
     }
     if (dragging && currentModel) {
-      handleDragRelease(e);
+      handleDragRelease(e, 'pointerupoutside');
       return;
     }
   });
 
   app.stage.on('pointercancel', () => {
     if (paramDragging && currentModel) {
-      handleParamHitRelease();
+      handleParamHitRelease('pointercancel');
       return;
     }
     if (dragging && currentModel) {
-      handleDragRelease();
+      handleDragRelease(undefined, 'pointercancel');
     }
   });
 
@@ -242,6 +288,7 @@ const ready = app.init({
     for (const kt of keyTriggerItems) {
       if (e.keyCode === kt.keyCode && kt.downMtn) {
         const [g, idxStr] = kt.downMtn.split(':');
+        traceLog('trigger', 'key', { keyCode: e.keyCode, motion: kt.downMtn });
         console.log(`[key] KeyTrigger ${e.keyCode} → ${kt.downMtn}`);
         playMotion(g, idxStr !== undefined ? parseInt(idxStr) : undefined);
         break;
@@ -476,12 +523,30 @@ function updateParamHitState(state, value, coreModel) {
   // pointer is released. Reset the latch after moving away so a later
   // crossing can fire again during the same interaction.
   if (previousValue < max && state.currentValue >= max) {
+    traceLog('trigger', 'param-max-crossed', {
+      interactionId: paramDragging?.interactionId,
+      hitArea: paramDragging?.hitArea,
+      param: state.item.paramId,
+      previous: Number(previousValue.toFixed(3)),
+      value: Number(state.currentValue.toFixed(3)),
+      max: Number(max.toFixed(3)),
+      motion: state.item.maxMtn,
+    });
     if (item.maxMtn) triggerParamHitMotions([state], 'maxMtn', 'MaxMtn');
     state.maxReached = true;
   } else if (state.currentValue < max) {
     state.maxReached = false;
   }
   if (previousValue > min && state.currentValue <= min) {
+    traceLog('trigger', 'param-min-crossed', {
+      interactionId: paramDragging?.interactionId,
+      hitArea: paramDragging?.hitArea,
+      param: state.item.paramId,
+      previous: Number(previousValue.toFixed(3)),
+      value: Number(state.currentValue.toFixed(3)),
+      min: Number(min.toFixed(3)),
+      motion: state.item.minMtn,
+    });
     if (item.minMtn) triggerParamHitMotions([state], 'minMtn', 'MinMtn');
     state.minReached = true;
   } else if (state.currentValue > min) {
@@ -885,21 +950,6 @@ function triggerDragMotions() {
   }
 }
 
-function resolveMaxMtn(ref, depth = 0) {
-  if (depth > 5) return ref;
-  const resolved = resolveMotionRef(ref);
-  const [group, idxStr] = resolved.split(':');
-  const entries = modelMotions[group];
-  if (!entries) return resolved;
-  const idx = idxStr !== undefined ? parseInt(idxStr) : 0;
-  const entry = entries[idx];
-  if (!entry) return resolved;
-  if (entry.Command && entry.Command.startsWith('start_mtn ')) {
-    return resolveMaxMtn(entry.Command.substring('start_mtn '.length).trim(), depth + 1);
-  }
-  return resolved;
-}
-
 function motionShouldLoop(group, entry) {
   if (entry?.FileLoop !== undefined) return Boolean(entry.FileLoop);
   if (entry?.WrapMode !== undefined) return Number(entry.WrapMode) === 1;
@@ -929,11 +979,13 @@ function playMotion(group, index, priority) {
   }
   const entry = motionEntryMap[group]?.[index];
 
-  // Execute Command
-  if (entry?.Command) executeCommand(entry.Command);
-
   // Apply VarFloat actions
   if (entry?.VarFloats) applyVarFloatActions(entry);
+
+  // Apply state changes before following command routes. Models commonly use
+  // an Option entry to assign a state variable and then start an Action; the
+  // following Idle selection must see the new state.
+  if (entry?.Command) executeCommand(entry.Command);
 
   // Apply Intimacy bonus
   if (entry && intimacyConfig) applyIntimacyBonus(entry);
@@ -973,11 +1025,27 @@ function playMotion(group, index, priority) {
   // Use entry Priority if available
   const motionPriority = priority ?? (entry?.Priority ?? 2);
   const shouldLoop = motionShouldLoop(group, entry);
+  const requestId = ++motionRequestSequence;
 
   console.log(`[motion] playMotion ${group}:${index} priority=${motionPriority}`);
+  traceLog('motion', 'request', {
+    requestId,
+    group,
+    index,
+    name: entry?.Name,
+    priority: motionPriority,
+    loop: shouldLoop,
+    file: entry?.File,
+    source: 'runtime',
+  });
   // Pass loop explicitly because the engine otherwise falls back to the
   // motion file's Meta.Loop value, which is true for many one-shot clips.
-  currentModel.motion(group, index, motionPriority, { loop: shouldLoop });
+  const request = currentModel.motion(group, index, motionPriority, { loop: shouldLoop });
+  Promise.resolve(request).then(started => {
+    traceLog('motion', 'request-result', { requestId, started });
+  }).catch(error => {
+    traceLog('motion', 'request-error', { requestId, error: String(error) });
+  });
 }
 
 // Weighted random selection with VarFloat/Intimacy/PreMtn filtering
@@ -1366,14 +1434,28 @@ function triggerParamHitMotions(states, property, label) {
     if (!refs.has(ref) || priority === 1) refs.set(ref, priority);
   }
   for (const [ref, priority] of refs) {
+    traceLog('trigger', `param-${label.toLowerCase()}`, {
+      interactionId: paramDragging?.interactionId,
+      hitArea: paramDragging?.hitArea,
+      property,
+      motion: ref,
+      priority: priority ?? 2,
+      params: states.map(state => state.item.paramId),
+    });
     console.log(`[motion] drag ${label}: ${ref}`);
     playMotionRef(ref, priority);
   }
 }
 
-function handleParamHitRelease() {
+function handleParamHitRelease(reason = 'release') {
   if (!paramDragging || !currentModel) return;
   const { hitArea, items } = paramDragging;
+  traceLog('touch', 'param-release', {
+    interactionId: paramDragging.interactionId,
+    pointerId: paramDragging.pointerId,
+    reason,
+    hitArea,
+  });
   const coreModel = currentModel.internalModel.coreModel;
   const endStates = [];
   for (const state of items) {
@@ -1387,6 +1469,11 @@ function handleParamHitRelease() {
     if (item.lockParam) {
       paramReleaseAnims = paramReleaseAnims.filter(anim => anim.paramIndex !== paramIndex);
       paramHitLocks[paramIndex] = { value: currentValue };
+      traceLog('touch', 'param-release-lock', {
+        interactionId: paramDragging.interactionId,
+        param: item.paramId,
+        value: Number(currentValue.toFixed(3)),
+      });
     } else {
       delete paramHitLocks[paramIndex];
       const speed = item.releaseDuration > 0 ? 1 / (item.releaseDuration / 16.67) : 0.05;
@@ -1397,6 +1484,14 @@ function handleParamHitRelease() {
         releaseType: item.releaseType,
         speed,
         t: 0,
+      });
+      traceLog('touch', 'param-release-restore', {
+        interactionId: paramDragging.interactionId,
+        param: item.paramId,
+        from: Number(currentValue.toFixed(3)),
+        target: Number(startValue.toFixed(3)),
+        releaseType: item.releaseType,
+        duration: item.releaseDuration,
       });
     }
 
@@ -1409,8 +1504,16 @@ function handleParamHitRelease() {
   updateInputRegion();
 }
 
-function handleDragRelease() {
+function handleDragRelease(_event, reason = 'release') {
+  traceLog('touch', 'model-drag-release', {
+    interactionId: dragInteractionId,
+    reason,
+    moved: dragMoved,
+    modelX: currentModel ? Number(currentModel.x.toFixed(1)) : null,
+    modelY: currentModel ? Number(currentModel.y.toFixed(1)) : null,
+  });
   dragging = false;
+  dragInteractionId = null;
   dragHitNames = [];
   if (!lockModel) savePosition();
   updateInputRegion();
@@ -1529,7 +1632,31 @@ async function loadModel(modelPath) {
           if (items.length > 0) {
             console.log(`[touch] pointerdown on ParamHit area: ${name} (params: ${items.map(item => item.paramId).join(', ')})`);
             const coreModel = model.internalModel.coreModel;
+            const interactionId = ++interactionSequence;
+            lastInteractionId = interactionId;
+            traceLog('touch', 'param-down', {
+              interactionId,
+              pointerId: e.pointerId,
+              button: e.button,
+              hitArea: name,
+              x: Number(e.global.x.toFixed(1)),
+              y: Number(e.global.y.toFixed(1)),
+              params: items.map(item => ({
+                param: item.paramId,
+                axis: item.axis,
+                type: item.type,
+                factor: item.factor,
+                weight: item.weight,
+                lockParam: item.lockParam,
+                minMtn: item.minMtn,
+                maxMtn: item.maxMtn,
+                beginMtn: item.beginMtn,
+                endMtn: item.endMtn,
+              })),
+            });
             paramDragging = {
+              interactionId,
+              pointerId: e.pointerId,
               hitArea: name,
               items: items.map(item => {
                 const startValue = coreModel.getParameterValueByIndex(item.paramIndex);
@@ -1549,6 +1676,7 @@ async function loadModel(modelPath) {
                 };
               }),
               hasMoved: false,
+              lastTraceAt: 0,
             };
             const indexes = new Set(items.map(item => item.paramIndex));
             paramReleaseAnims = paramReleaseAnims.filter(anim => !indexes.has(anim.paramIndex));
@@ -1563,11 +1691,22 @@ async function loadModel(modelPath) {
       }
 
       // Start an explicit action/state route for non-ParamHit drag areas.
+      const interactionId = ++interactionSequence;
+      lastInteractionId = interactionId;
       dragHitNames = sortHitNames(model.hitTest(e.global.x, e.global.y));
+      dragInteractionId = interactionId;
       dragStart.x = e.global.x;
       dragStart.y = e.global.y;
       triggerDragMotions();
 
+      traceLog('touch', 'model-down', {
+        interactionId,
+        pointerId: e.pointerId,
+        button: e.button,
+        x: Number(e.global.x.toFixed(1)),
+        y: Number(e.global.y.toFixed(1)),
+        hitAreas: dragHitNames,
+      });
       console.log(`[touch] pointerdown — drag hit areas: [${dragHitNames.join(', ')}]`);
       dragging = true;
       dragMoved = false;
@@ -1627,7 +1766,9 @@ async function loadModel(modelPath) {
           releaseDuration: finiteNumber(item.Release, 500),
           lockParam: item.LockParam ?? false,
           lowPriority: item.LowPriority === true || item.LowPriority === 1 || item.LowPriority === 'true',
-          maxMtn: item.MaxMtn ? resolveMaxMtn(item.MaxMtn) : null,
+          // Keep the original route. MaxMtn may point to an Option whose
+          // VarFloats changes the idle state before starting an Action.
+          maxMtn: item.MaxMtn ? resolveMotionRef(item.MaxMtn) : null,
           minMtn: item.MinMtn ? resolveMotionRef(item.MinMtn) : null,
           beginMtn: item.BeginMtn ? resolveMotionRef(item.BeginMtn) : null,
           endMtn: item.EndMtn ? resolveMotionRef(item.EndMtn) : null,
@@ -1774,6 +1915,15 @@ async function loadModel(modelPath) {
     // Parse Leave groups for timed idle
     parseLeaveGroups(modelMotions);
 
+    // The engine automatically starts a random idle motion after
+    // motionFinish. That bypasses VarFloats/weights and can select a
+    // different idle state than the model metadata allows. Idle transitions
+    // are handled below after the engine has completed its motion state.
+    const motionManager = model.internalModel.motionManager;
+    const nativeIdleGroup = motionManager.groups?.idle;
+    if (motionManager.groups) motionManager.groups.idle = '__rive2d_manual_idle__';
+    traceLog('motion', 'native-auto-idle-disabled', { nativeIdleGroup });
+
     // Override motionManager.update to apply paramHit values at the right
     // point in the update cycle (after motions, before physics/coreModel.update)
     const origMotionUpdate = model.internalModel.motionManager.update;
@@ -1900,42 +2050,74 @@ async function loadModel(modelPath) {
     model.internalModel.motionManager.on('motionStart', (group, index) => {
       const entry = motionEntryMap[group]?.[index];
       currentMotionInfo = { group, index, entry };
+      traceLog('motion', 'start', {
+        group,
+        index,
+        name: entry?.Name,
+        file: entry?.File,
+        priority: entry?.Priority,
+      });
     });
 
     // NextMtn chaining + PostCommand: when a motion finishes
     model.internalModel.motionManager.on('motionFinish', () => {
+      traceLog('motion', 'finish', {
+        group: currentMotionInfo?.group,
+        index: currentMotionInfo?.index,
+        name: currentMotionInfo?.entry?.Name,
+        file: currentMotionInfo?.entry?.File,
+        nextMtn: pendingNextMtn,
+        fallbackIdle: !pendingNextMtn && Boolean(idleGroup),
+      });
       playingStart = false;
 
       // Execute PostCommand from the finished motion
       if (currentMotionInfo?.entry?.PostCommand) {
         executeCommand(currentMotionInfo.entry.PostCommand);
       }
+      const nextMtn = pendingNextMtn;
+      pendingNextMtn = null;
       currentMotionInfo = null;
 
-      if (pendingNextMtn) {
-        const mtn = pendingNextMtn;
-        pendingNextMtn = null;
-        const resolved = resolveMotionRef(mtn);
-        const [group, idxStr] = resolved.split(':');
-        playMotion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
-      } else if (idleGroup) {
-        playMotion(idleGroup, undefined, 1);
-        // ExtraMotion: play layered idles
-        if (extraMotionEnabled && currentModel?.parallelMotion) {
-          const extraMotions = [];
-          for (let n = 1; modelMotions[`Idle#${n}`]; n++) {
-            const idx = selectMotionIndex(`Idle#${n}`) ?? 0;
-            extraMotions.push({ group: `Idle#${n}`, index: idx, priority: 1 });
-          }
-          if (extraMotions.length > 0) {
-            currentModel.parallelMotion(extraMotions).catch(() => {});
+      // MotionManager emits motionFinish before it calls state.complete().
+      // Defer the next request so the previous priority has been cleared.
+      queueMicrotask(() => {
+        if (currentModel !== model) return;
+        if (nextMtn) {
+          const resolved = resolveMotionRef(nextMtn);
+          const [group, idxStr] = resolved.split(':');
+          traceLog('motion', 'finish-transition', { type: 'NextMtn', nextMtn: resolved });
+          playMotion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
+        } else if (idleGroup) {
+          traceLog('motion', 'finish-transition', { type: 'Idle', group: idleGroup });
+          playMotion(idleGroup, undefined, 1);
+          // ExtraMotion: play layered idles
+          if (extraMotionEnabled && currentModel?.parallelMotion) {
+            const extraMotions = [];
+            for (let n = 1; modelMotions[`Idle#${n}`]; n++) {
+              const idx = selectMotionIndex(`Idle#${n}`) ?? 0;
+              extraMotions.push({ group: `Idle#${n}`, index: idx, priority: 1 });
+            }
+            if (extraMotions.length > 0) {
+              currentModel.parallelMotion(extraMotions).catch(() => {});
+            }
           }
         }
-      }
+      });
     });
 
     model.on('pointertap', (e) => {
       lastInteractionTime = Date.now();
+      traceLog('touch', 'tap', {
+        interactionId: lastInteractionId,
+        pointerId: e.pointerId,
+        button: e.button,
+        x: Number(e.global.x.toFixed(1)),
+        y: Number(e.global.y.toFixed(1)),
+        dragMoved,
+        rightClickMotion,
+        tapMotion,
+      });
       if (e.button === 2 && !rightClickMotion) {
         console.log('[touch] pointertap — skipped (right-click motions disabled)');
         return;
@@ -1966,6 +2148,12 @@ async function loadModel(modelPath) {
         if (mapped) {
           const [group, idxStr] = mapped.split(':');
           const arrayIdx = idxStr !== undefined ? parseInt(idxStr) : undefined;
+          traceLog('trigger', 'tap-motion', {
+            interactionId: lastInteractionId,
+            pointerId: e.pointerId,
+            hitArea: name,
+            motion: group + (arrayIdx !== undefined ? `:${arrayIdx}` : ''),
+          });
           console.log(`[touch] ${name}: triggering mapped motion ${group}` + (arrayIdx !== undefined ? `:${arrayIdx}` : ''));
           playMotion(group, arrayIdx);
           return; // stop — don't trigger overlapping hit areas
@@ -1979,6 +2167,12 @@ async function loadModel(modelPath) {
         for (const g of conventions) {
           const group = findMotionGroup(g);
           if (modelMotions[group]) {
+            traceLog('trigger', 'tap-convention-motion', {
+              interactionId: lastInteractionId,
+              pointerId: e.pointerId,
+              hitArea: name,
+              motion: group,
+            });
             playMotion(group);
             found = true;
             break;
