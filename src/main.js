@@ -699,6 +699,12 @@ function isDragHitArea(name) {
 function triggerDragMotions() {
   if (!currentModel) return;
   function startDragScrub(name, group, arrayIdx) {
+    const index = arrayIdx ?? selectMotionIndex(group);
+    const entry = index !== undefined ? motionEntryMap[group]?.[index] : undefined;
+    if (entry && !entry.File) {
+      console.log(`[motion] drag scrub skipped on ${name}: ${group} has no motion file`);
+      return;
+    }
     console.log(`[motion] drag scrub on ${name}: ${group}` + (arrayIdx !== undefined ? `:${arrayIdx}` : ''));
     dragScrubState = { entry: null, duration: 0, progress: 0, hitArea: name, ready: false, beginFired: false };
     currentModel.motion(group, arrayIdx).then(() => {
@@ -714,6 +720,20 @@ function triggerDragMotions() {
       const arrayIdx = idxStr !== undefined ? parseInt(idxStr) : undefined;
       startDragScrub(name, group, arrayIdx);
       return;
+    }
+    // Some models use TouchDrag hit areas to select a looping touch state,
+    // e.g. TouchDrag1 -> touchidle:1. Start that state on pointerdown so it
+    // still applies when the pointer is dragged out of the hit area.
+    if (isDragHitArea(name) && mapped && mapped !== '__none__') {
+      const [group, idxStr] = mapped.split(':');
+      const arrayIdx = idxStr !== undefined ? parseInt(idxStr) : undefined;
+      const index = arrayIdx ?? selectMotionIndex(group);
+      const entry = index !== undefined ? motionEntryMap[group]?.[index] : undefined;
+      if (entry?.File) {
+        console.log(`[motion] drag state on ${name}: ${group}` + (arrayIdx !== undefined ? `:${arrayIdx}` : ''));
+        playMotion(group, arrayIdx);
+        return;
+      }
     }
     // 2. Convention fallbacks. TouchDrag1/drag1 are also valid motion group
     // names, while older models use Drag<HitArea> or drag_<HitArea>.
@@ -847,6 +867,21 @@ function isMotionEligible(group, index, entry) {
   return true;
 }
 
+// Cubism's getParameterIndex expects a CubismId handle, not a JavaScript
+// string. Resolve against the model's registered IDs to avoid creating a
+// synthetic missing parameter for every controller lookup.
+function getParameterIndexById(coreModel, parameterId) {
+  if (!coreModel || !parameterId || typeof coreModel.getParameterId !== 'function') return -1;
+  const count = coreModel.getParameterCount();
+  for (let index = 0; index < count; index++) {
+    const id = coreModel.getParameterId(index);
+    const value = id?.getString?.();
+    const text = typeof value === 'string' ? value : value?.s;
+    if (text === parameterId) return index;
+  }
+  return -1;
+}
+
 // --- VarFloats system ---
 
 function checkVarFloatConditions(entry) {
@@ -859,9 +894,9 @@ function checkVarFloatConditions(entry) {
     if (name && name.startsWith('@') && currentModel) {
       const paramId = name.substring(1);
       const cm = currentModel.internalModel.coreModel;
-      const idx = cm.getParameterIndex(paramId);
+      const idx = getParameterIndexById(cm, paramId);
       const count = cm.getParameterCount();
-      value = idx < count ? cm.getParameterValueByIndex(idx) : 0;
+      value = idx >= 0 && idx < count ? cm.getParameterValueByIndex(idx) : 0;
     } else {
       value = varStore[name] ?? 0;
     }
@@ -890,9 +925,9 @@ function applyVarFloatActions(entry) {
     if (name && name.startsWith('@') && currentModel) {
       const paramId = name.substring(1);
       const cm = currentModel.internalModel.coreModel;
-      const idx = cm.getParameterIndex(paramId);
+      const idx = getParameterIndexById(cm, paramId);
       const count = cm.getParameterCount();
-      if (idx < count) {
+      if (idx >= 0 && idx < count) {
         if (op === 'assign') cm.setParameterValueByIndex(idx, target);
         else if (op === 'add') cm.setParameterValueByIndex(idx, cm.getParameterValueByIndex(idx) + target);
       }
@@ -950,16 +985,16 @@ function executeOneCommand(cmd) {
       if (action === 'lock' && id) {
         const value = parseFloat(parts[3]) || 0;
         const duration = parts[4] ? parseFloat(parts[4]) : 0;
-        const idx = cm.getParameterIndex(id);
-        if (idx < paramCount) {
+        const idx = getParameterIndexById(cm, id);
+        if (idx >= 0 && idx < paramCount) {
           lockedParams[id] = { paramIndex: idx, value, startTime: performance.now(), duration };
         }
       } else if (action === 'unlock' && id) {
         for (const pid of id.split(',')) delete lockedParams[pid.trim()];
       } else if (action === 'set' && id) {
         const value = parseFloat(parts[3]) || 0;
-        const idx = cm.getParameterIndex(id);
-        if (idx < paramCount) cm.setParameterValueByIndex(idx, value);
+        const idx = getParameterIndexById(cm, id);
+        if (idx >= 0 && idx < paramCount) cm.setParameterValueByIndex(idx, value);
       }
       break;
     }
@@ -1473,8 +1508,8 @@ async function loadModel(modelPath) {
       for (const item of hitParamItems) {
         if (item.Enabled === false) continue;
         const paramId = item.Id || item.id;
-        const rawIdx = coreModel.getParameterIndex(paramId);
-        const paramIndex = rawIdx < paramCount ? rawIdx : -1;
+        const rawIdx = getParameterIndexById(coreModel, paramId);
+        const paramIndex = rawIdx >= 0 && rawIdx < paramCount ? rawIdx : -1;
         paramHitItems.push({
           hitArea: item.HitArea || item.hitArea,
           paramId,
@@ -1511,8 +1546,8 @@ async function loadModel(modelPath) {
         const ids = item.Ids || (item.Id ? [item.Id] : []);
         for (const paramId of ids) {
           if (!paramId) continue;
-          const rawLoopIdx = coreModel.getParameterIndex(paramId);
-          const paramIndex = rawLoopIdx < loopParamCount ? rawLoopIdx : -1;
+          const rawLoopIdx = getParameterIndexById(coreModel, paramId);
+          const paramIndex = rawLoopIdx >= 0 && rawLoopIdx < loopParamCount ? rawLoopIdx : -1;
           if (paramIndex < 0) continue;
           paramLoopItems.push({
             paramIndex,
@@ -1548,8 +1583,8 @@ async function loadModel(modelPath) {
         if (item.Enabled === false) continue;
         const paramId = item.Id;
         if (!paramId) continue;
-        const rawIdx = coreModel.getParameterIndex(paramId);
-        const paramIndex = rawIdx < paramCount ? rawIdx : -1;
+        const rawIdx = getParameterIndexById(coreModel, paramId);
+        const paramIndex = rawIdx >= 0 && rawIdx < paramCount ? rawIdx : -1;
         if (paramIndex < 0) continue;
         paramTriggerItems.push({
           paramId,
@@ -1597,8 +1632,8 @@ async function loadModel(modelPath) {
         const ids = item.Ids || (item.Id ? [item.Id] : []);
         for (const paramId of ids) {
           if (!paramId) continue;
-          const rawIdx = coreModel.getParameterIndex(paramId);
-          if (rawIdx < paramCount) {
+          const rawIdx = getParameterIndexById(coreModel, paramId);
+          if (rawIdx >= 0 && rawIdx < paramCount) {
             coreModel.setParameterValueByIndex(rawIdx, value);
             lockedParams[paramId] = { paramIndex: rawIdx, value, startTime: performance.now(), duration: 0 };
           }
@@ -1755,6 +1790,12 @@ async function loadModel(modelPath) {
 
     // NextMtn chaining + PostCommand: when a motion finishes
     model.internalModel.motionManager.on('motionFinish', () => {
+      // A drag scrub owns the motion queue until release. Do not replace the
+      // scrubbed motion with Idle while the pointer is still being dragged.
+      if (dragScrubState) {
+        console.log('[motion] motionFinish deferred while drag scrub is active');
+        return;
+      }
       playingStart = false;
 
       // Execute PostCommand from the finished motion
