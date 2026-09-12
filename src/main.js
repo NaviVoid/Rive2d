@@ -187,6 +187,7 @@ const ready = app.init({
     if (lockModel) return;
     currentModel.x = e.global.x - dragOffset.x;
     currentModel.y = e.global.y - dragOffset.y;
+    clampModelPosition();
     updateBorder();
   });
 
@@ -268,6 +269,7 @@ const ready = app.init({
   window.addEventListener('resize', () => {
     app.stage.hitArea = new PIXI.Rectangle(0, 0, app.screen.width, app.screen.height);
     if (currentModel) {
+      clampModelPosition();
       updateInputRegion();
     }
   });
@@ -431,6 +433,34 @@ function getParamHitBounds(item, coreModel, paramIndex) {
     min: Number.isFinite(item.minValue) ? Math.max(modelMin, item.minValue) : modelMin,
     max: Number.isFinite(item.maxValue) ? Math.min(modelMax, item.maxValue) : modelMax,
   };
+}
+
+function clampModelPosition() {
+  if (!currentModel) return;
+  const bounds = currentModel.getBounds();
+  const width = app.screen.width;
+  const height = app.screen.height;
+  let dx = 0;
+  let dy = 0;
+
+  if (bounds.width >= width) {
+    dx = width / 2 - (bounds.x + bounds.width / 2);
+  } else if (bounds.x < 0) {
+    dx = -bounds.x;
+  } else if (bounds.x + bounds.width > width) {
+    dx = width - (bounds.x + bounds.width);
+  }
+
+  if (bounds.height >= height) {
+    dy = height / 2 - (bounds.y + bounds.height / 2);
+  } else if (bounds.y < 0) {
+    dy = -bounds.y;
+  } else if (bounds.y + bounds.height > height) {
+    dy = height - (bounds.y + bounds.height);
+  }
+
+  currentModel.x += dx;
+  currentModel.y += dy;
 }
 
 function updateParamHitState(state, value, coreModel) {
@@ -638,6 +668,7 @@ function resetModelPosition() {
   currentModel.scale.set(Math.min(scaleX, scaleY) * 0.3);
   currentModel.x = app.screen.width / 2;
   currentModel.y = app.screen.height / 2;
+  clampModelPosition();
   updateBorder();
   updateInputRegion();
 }
@@ -1328,14 +1359,16 @@ function checkLeaveTimers() {
 // --- Drag release handlers ---
 
 function triggerParamHitMotions(states, property, label) {
-  const refs = new Set();
+  const refs = new Map();
   for (const state of states) {
     const ref = state.item?.[property] || state[property];
-    if (ref) refs.add(ref);
+    if (!ref) continue;
+    const priority = state.item?.lowPriority ? 1 : undefined;
+    if (!refs.has(ref) || priority === 1) refs.set(ref, priority);
   }
-  for (const ref of refs) {
+  for (const [ref, priority] of refs) {
     console.log(`[motion] drag ${label}: ${ref}`);
-    playMotionRef(ref);
+    playMotionRef(ref, priority);
   }
 }
 
@@ -1475,6 +1508,8 @@ async function loadModel(modelPath) {
       model.x = app.screen.width / 2;
       model.y = app.screen.height / 2;
     }
+    currentModel = model;
+    clampModelPosition();
 
     // Enable interaction for drag
     model.eventMode = 'static';
@@ -1592,6 +1627,7 @@ async function loadModel(modelPath) {
           releaseType: finiteNumber(item.ReleaseType, 0),
           releaseDuration: finiteNumber(item.Release, 500),
           lockParam: item.LockParam ?? false,
+          lowPriority: item.LowPriority === true || item.LowPriority === 1 || item.LowPriority === 'true',
           maxMtn: item.MaxMtn ? resolveMaxMtn(item.MaxMtn) : null,
           minMtn: item.MinMtn ? resolveMotionRef(item.MinMtn) : null,
           beginMtn: item.BeginMtn ? resolveMotionRef(item.BeginMtn) : null,
@@ -1966,7 +2002,6 @@ async function loadModel(modelPath) {
     // Redraw hit areas on each frame (drawables move with animations)
     app.ticker.add(drawHitAreas);
 
-    currentModel = model;
     showBorder = config.show_border;
     rightClickMotion = config.right_click_motion;
     showHitAreas = config.show_hit_areas;

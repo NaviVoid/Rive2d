@@ -385,10 +385,6 @@ pointerdown; it executes once from `pointertap` instead.
 
 ## Known Runtime Gaps
 
-This document records the target semantics and the remaining implementation
-gap:
-
-- `LowPriority` is parsed from model metadata but is not yet used to adjust
-  the priority of a `ParamHit` action motion.
-- Screen-boundary clamping for ordinary model position dragging is separate
-  from `ParamHit` parameter limits and remains a runtime policy to implement.
+The runtime now applies `LowPriority` to ParamHit action motions and clamps
+ordinary model dragging to the viewport. `MinValue`/`MaxValue` remain model
+parameter limits, not screen coordinates.
