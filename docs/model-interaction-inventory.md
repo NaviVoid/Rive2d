@@ -111,6 +111,10 @@ parameter interactions in the JSON configuration; their visible animation is
 the model deformation produced by the changing parameter and any controllers
 or physics that respond to it.
 
+`Factor` is applied directly to screen-space pointer movement. Runtime model
+scale must not multiply it again, otherwise shrinking a model also makes the
+drag distance required to reach `MinValue`/`MaxValue` unnecessarily larger.
+
 ## Scope
 
 The scan covered the 66 model paths registered in the local Rive2d database.

@@ -160,7 +160,6 @@ const ready = app.init({
       if (!dragMoved && dx * dx + dy * dy >= DRAG_THRESHOLD * DRAG_THRESHOLD) {
         dragMoved = true;
       }
-      const scale = currentModel?.scale.x || 1;
       const coreModel = currentModel.internalModel.coreModel;
       for (const state of paramDragging.items) {
         const { item, startValue, paramIndex } = state;
@@ -169,8 +168,8 @@ const ready = app.init({
         state.lastPos = currentPos;
         if (item.type === 2) continue;
         const value = item.type === 1
-          ? state.targetValue + Math.abs(delta) * item.factor * scale
-          : startValue + (currentPos - state.startPos) * item.factor * scale;
+          ? state.targetValue + Math.abs(delta) * item.factor
+          : startValue + (currentPos - state.startPos) * item.factor;
         updateParamHitState(state, value, coreModel);
       }
       return;
