@@ -12,6 +12,7 @@ pub struct AppConfig {
     pub model_y: Option<f64>,
     pub model_scale: Option<f64>,
     pub tap_motion: bool,
+    pub right_click_motion: bool,
     pub show_hit_areas: bool,
     pub lock_model: bool,
     pub mouse_tracking: bool,
@@ -119,6 +120,15 @@ pub fn load(app: &tauri::AppHandle) -> AppConfig {
         .map(|v| v == "true")
         .unwrap_or(true);
 
+    let right_click_motion: bool = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'right_click_motion'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
     let show_hit_areas: bool = conn
         .query_row(
             "SELECT value FROM config WHERE key = 'show_hit_areas'",
@@ -154,6 +164,7 @@ pub fn load(app: &tauri::AppHandle) -> AppConfig {
         model_y,
         model_scale,
         tap_motion,
+        right_click_motion,
         show_hit_areas,
         lock_model,
         mouse_tracking,
@@ -168,6 +179,51 @@ pub fn has_hash(app: &tauri::AppHandle, hash: &str) -> bool {
         |_| Ok(()),
     )
     .is_ok()
+}
+
+pub fn has_model_path(app: &tauri::AppHandle, path: &str) -> bool {
+    let conn = open_db(app);
+    conn.query_row("SELECT 1 FROM models WHERE path = ?1", [path], |_| Ok(()))
+        .is_ok()
+}
+
+/// Check whether a file belongs to an imported model or is a registered preview.
+/// Canonicalization prevents `..` components and symlinks from escaping the model root.
+pub fn is_allowed_model_asset(app: &tauri::AppHandle, path: &std::path::Path) -> bool {
+    let Ok(candidate) = path.canonicalize() else {
+        return false;
+    };
+    let conn = open_db(app);
+
+    let mut models = match conn.prepare("SELECT path FROM models") {
+        Ok(stmt) => stmt,
+        Err(_) => return false,
+    };
+    let model_roots = match models.query_map([], |row| row.get::<_, String>(0)) {
+        Ok(rows) => rows
+            .filter_map(|row| row.ok())
+            .filter_map(|model| std::path::PathBuf::from(model).canonicalize().ok())
+            .filter_map(|model| model.parent().map(std::path::Path::to_path_buf))
+            .collect::<Vec<_>>(),
+        Err(_) => return false,
+    };
+
+    if model_roots.iter().any(|root| candidate.starts_with(root)) {
+        return true;
+    }
+
+    let Ok(mut previews) = conn.prepare("SELECT value FROM config WHERE key LIKE 'preview:%'")
+    else {
+        return false;
+    };
+    previews
+        .query_map([], |row| row.get::<_, String>(0))
+        .map(|rows| {
+            rows.filter_map(|row| row.ok())
+                .filter_map(|preview| std::path::PathBuf::from(preview).canonicalize().ok())
+                .any(|preview| preview == candidate)
+        })
+        .unwrap_or(false)
 }
 
 pub fn add_model(app: &tauri::AppHandle, path: &str, source_hash: Option<&str>) {
@@ -200,11 +256,9 @@ pub fn remove_model(app: &tauri::AppHandle, path: &str) {
 
 pub fn get_setting(app: &tauri::AppHandle, key: &str) -> Option<String> {
     let conn = open_db(app);
-    conn.query_row(
-        "SELECT value FROM config WHERE key = ?1",
-        [key],
-        |row| row.get(0),
-    )
+    conn.query_row("SELECT value FROM config WHERE key = ?1", [key], |row| {
+        row.get(0)
+    })
     .ok()
 }
 
@@ -220,7 +274,8 @@ pub fn set_setting(app: &tauri::AppHandle, key: &str, value: &str) {
 pub fn delete_settings(app: &tauri::AppHandle, keys: &[&str]) {
     let conn = open_db(app);
     for key in keys {
-        conn.execute("DELETE FROM config WHERE key = ?1", [key]).ok();
+        conn.execute("DELETE FROM config WHERE key = ?1", [key])
+            .ok();
     }
 }
 
@@ -231,9 +286,6 @@ pub fn set_model(app: &tauri::AppHandle, path: &str) {
         [path],
     )
     .ok();
-    conn.execute(
-        "INSERT OR IGNORE INTO models (path) VALUES (?1)",
-        [path],
-    )
-    .ok();
+    conn.execute("INSERT OR IGNORE INTO models (path) VALUES (?1)", [path])
+        .ok();
 }

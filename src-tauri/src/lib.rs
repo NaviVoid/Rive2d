@@ -18,19 +18,49 @@ pub fn run() {
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|_app, _args, _cwd| {}))
         .plugin(tauri_plugin_dialog::init())
-        .register_uri_scheme_protocol("model", |_ctx, request| {
+        .register_uri_scheme_protocol("model", |ctx, request| {
             // Serve model files from the filesystem via model:// protocol
-            let uri = request.uri().to_string();
-            // URI format: model://localhost/<absolute-path>
-            let path = uri
-                .strip_prefix("model://localhost/")
-                .or_else(|| uri.strip_prefix("model://localhost"))
-                .unwrap_or("");
-            let path = percent_encoding::percent_decode_str(path)
-                .decode_utf8_lossy()
-                .to_string();
+            if request.method() == tauri::http::Method::OPTIONS {
+                return tauri::http::Response::builder()
+                    .status(204)
+                    .header("Access-Control-Allow-Origin", "*")
+                    .header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+                    .header("Access-Control-Allow-Headers", "*")
+                    .body(Vec::new())
+                    .unwrap();
+            }
+            if request.method() != tauri::http::Method::GET
+                && request.method() != tauri::http::Method::HEAD
+            {
+                return tauri::http::Response::builder()
+                    .status(405)
+                    .body(b"Method not allowed".to_vec())
+                    .unwrap();
+            }
+
+            // Generated URLs contain two slashes before an absolute path:
+            // model://localhost//home/... . Remove only the URI delimiter slash.
+            let raw_path = request.uri().path();
+            let raw_path = raw_path.strip_prefix('/').unwrap_or(raw_path);
+            let path = match percent_encoding::percent_decode_str(raw_path).decode_utf8() {
+                Ok(path) => path.into_owned(),
+                Err(_) => {
+                    return tauri::http::Response::builder()
+                        .status(400)
+                        .body(b"Invalid path encoding".to_vec())
+                        .unwrap();
+                }
+            };
 
             let file_path = std::path::Path::new(&path);
+            if !file_path.is_absolute()
+                || !config::is_allowed_model_asset(ctx.app_handle(), file_path)
+            {
+                return tauri::http::Response::builder()
+                    .status(403)
+                    .body(b"Access denied".to_vec())
+                    .unwrap();
+            }
             match std::fs::read(file_path) {
                 Ok(mut data) => {
                     let mime = match file_path.extension().and_then(|e| e.to_str()) {
@@ -52,7 +82,9 @@ pub fn run() {
                                 let mut patched_any = false;
 
                                 // Add missing "Groups" field required by Cubism SDK
-                                if json.get("FileReferences").is_some() && json.get("Groups").is_none() {
+                                if json.get("FileReferences").is_some()
+                                    && json.get("Groups").is_none()
+                                {
                                     json["Groups"] = serde_json::json!([]);
                                     patched_any = true;
                                 }
@@ -60,13 +92,12 @@ pub fn run() {
                                 // Remove empty texture entries — LPK extraction can leave
                                 // empty strings which cause Assets.load("") to return a
                                 // plain object instead of a Texture, crashing the renderer.
-                                if let Some(textures) = json.pointer_mut("/FileReferences/Textures")
+                                if let Some(textures) = json
+                                    .pointer_mut("/FileReferences/Textures")
                                     .and_then(|v| v.as_array_mut())
                                 {
                                     let before = textures.len();
-                                    textures.retain(|v| {
-                                        v.as_str().map_or(true, |s| !s.is_empty())
-                                    });
+                                    textures.retain(|v| v.as_str().is_none_or(|s| !s.is_empty()));
                                     if textures.len() != before {
                                         patched_any = true;
                                     }
@@ -87,7 +118,10 @@ pub fn run() {
                     if mime == "application/json" {
                         if let Ok(text) = std::str::from_utf8(&data) {
                             if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text) {
-                                if json.get("Meta").and_then(|m| m.get("TotalPointCount")).is_some()
+                                if json
+                                    .get("Meta")
+                                    .and_then(|m| m.get("TotalPointCount"))
+                                    .is_some()
                                     && json.get("Curves").and_then(|c| c.as_array()).is_some()
                                 {
                                     let curves = json["Curves"].as_array().unwrap();
@@ -95,19 +129,26 @@ pub fn run() {
                                     let mut total_segments: u64 = 0;
 
                                     for curve in curves {
-                                        if let Some(segs) = curve.get("Segments").and_then(|s| s.as_array()) {
-                                            if segs.len() < 2 { continue; }
+                                        if let Some(segs) =
+                                            curve.get("Segments").and_then(|s| s.as_array())
+                                        {
+                                            if segs.len() < 2 {
+                                                continue;
+                                            }
                                             total_points += 1; // initial point (time, value)
                                             let mut i = 2;
                                             while i < segs.len() {
-                                                let seg_type = segs[i].as_f64().unwrap_or(-1.0) as i64;
+                                                let seg_type =
+                                                    segs[i].as_f64().unwrap_or(-1.0) as i64;
                                                 match seg_type {
-                                                    0 | 2 | 3 => { // Linear / Stepped / InvStepped
+                                                    0 | 2 | 3 => {
+                                                        // Linear / Stepped / InvStepped
                                                         total_points += 1;
                                                         total_segments += 1;
                                                         i += 3;
                                                     }
-                                                    1 => { // Bezier
+                                                    1 => {
+                                                        // Bezier
                                                         total_points += 3;
                                                         total_segments += 1;
                                                         i += 7;
@@ -118,8 +159,10 @@ pub fn run() {
                                         }
                                     }
 
-                                    json["Meta"]["TotalPointCount"] = serde_json::json!(total_points);
-                                    json["Meta"]["TotalSegmentCount"] = serde_json::json!(total_segments);
+                                    json["Meta"]["TotalPointCount"] =
+                                        serde_json::json!(total_points);
+                                    json["Meta"]["TotalSegmentCount"] =
+                                        serde_json::json!(total_segments);
                                     if let Ok(patched) = serde_json::to_vec(&json) {
                                         data = patched;
                                     }
@@ -211,6 +254,10 @@ pub fn run() {
 
 pub fn create_config_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("config") {
+        let (config_width, config_height) = config_window_size(app);
+        if let Err(error) = window.set_size(tauri::LogicalSize::new(config_width, config_height)) {
+            eprintln!("[rive2d] Failed to resize config window: {}", error);
+        }
         window.show().ok();
         window.set_focus().ok();
         return;
@@ -229,9 +276,10 @@ pub fn create_config_window(app: &tauri::AppHandle) {
         }
     };
 
+    let (config_width, config_height) = config_window_size(app);
     let config_window = tauri::WebviewWindowBuilder::new(app, "config", url)
         .title("Rive2d Settings")
-        .inner_size(1024.0, 1024.0)
+        .inner_size(config_width, config_height)
         .resizable(false)
         .build()
         .expect("Failed to create config window");
@@ -245,6 +293,28 @@ pub fn create_config_window(app: &tauri::AppHandle) {
     });
 }
 
+/// Size the settings window as a percentage of the primary monitor's usable area.
+/// Tauri expects logical pixels, while monitor work areas are reported in physical pixels.
+fn config_window_size(app: &tauri::AppHandle) -> (f64, f64) {
+    const WINDOW_RATIO: f64 = 0.8;
+
+    let monitor = app.primary_monitor().ok().flatten().or_else(|| {
+        app.available_monitors()
+            .ok()
+            .and_then(|mut monitors| monitors.drain(..).next())
+    });
+    let Some(monitor) = monitor else {
+        return (800.0, 800.0);
+    };
+
+    let scale_factor = monitor.scale_factor().max(1.0);
+    let work_area = monitor.work_area().size;
+    (
+        (work_area.width as f64 / scale_factor * WINDOW_RATIO).max(1.0),
+        (work_area.height as f64 / scale_factor * WINDOW_RATIO).max(1.0),
+    )
+}
+
 #[tauri::command]
 fn get_config(app: tauri::AppHandle) -> config::AppConfig {
     config::load(&app)
@@ -253,7 +323,7 @@ fn get_config(app: tauri::AppHandle) -> config::AppConfig {
 #[tauri::command]
 async fn add_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
     let p = std::path::Path::new(&path);
-    if !p.exists() {
+    if !p.is_file() {
         return Err("File not found".to_string());
     }
 
@@ -263,8 +333,8 @@ async fn add_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
     }
 
     let model_path = match p.extension().and_then(|e| e.to_str()) {
-        Some("lpk") => extract_lpk(&app, &path)?,
-        Some("json") => path,
+        Some(ext) if ext.eq_ignore_ascii_case("lpk") => extract_lpk(&app, &path, &hash)?,
+        Some(ext) if ext.eq_ignore_ascii_case("json") => path,
         _ => return Err("Unsupported format. Use .lpk or .model3.json".to_string()),
     };
 
@@ -277,19 +347,38 @@ fn file_md5(path: &std::path::Path) -> Result<String, String> {
     Ok(format!("{:x}", md5::compute(&data)))
 }
 
-fn extract_lpk(app: &tauri::AppHandle, lpk_path: &str) -> Result<String, String> {
+fn extract_lpk(
+    app: &tauri::AppHandle,
+    lpk_path: &str,
+    source_hash: &str,
+) -> Result<String, String> {
     let lpk = std::path::Path::new(lpk_path);
     let stem = lpk
         .file_stem()
         .and_then(|s| s.to_str())
         .ok_or("Invalid file name")?;
+    let safe_stem: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_stem = if safe_stem.is_empty() {
+        "model"
+    } else {
+        &safe_stem
+    };
 
     let models_dir = app
         .path()
         .app_data_dir()
         .expect("Failed to get app data dir")
         .join("models")
-        .join(stem);
+        .join(format!("{}-{}", safe_stem, source_hash));
 
     lpk::extract_lpk(&models_dir, lpk_path)
 }
@@ -348,13 +437,16 @@ async fn add_models_from_dir(app: tauri::AppHandle, path: String) -> Result<Impo
         let path_str = lpk_path.to_string_lossy().to_string();
         let hash = match file_md5(lpk_path) {
             Ok(h) => h,
-            Err(_) => continue,
+            Err(e) => {
+                errors.push(format!("{}: failed to read source: {}", name, e));
+                continue;
+            }
         };
         if config::has_hash(&app, &hash) {
             skipped += 1;
             continue;
         }
-        match extract_lpk(&app, &path_str) {
+        match extract_lpk(&app, &path_str, &hash) {
             Ok(model_path) => {
                 config::add_model(&app, &model_path, Some(&hash));
                 imported += 1;
@@ -412,6 +504,9 @@ fn remove_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn apply_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    if !config::has_model_path(&app, &path) || !std::path::Path::new(&path).is_file() {
+        return Err("Model is not registered or no longer exists".to_string());
+    }
     config::set_model(&app, &path);
 
     // Clear old model's position/scale so new model starts centered
@@ -507,9 +602,30 @@ fn get_model_preview(app: tauri::AppHandle, path: String) -> Option<String> {
 }
 
 #[tauri::command]
-fn set_model_preview(app: tauri::AppHandle, model_path: String, image_path: String) -> Result<(), String> {
-    if !std::path::Path::new(&image_path).exists() {
+fn set_model_preview(
+    app: tauri::AppHandle,
+    model_path: String,
+    image_path: String,
+) -> Result<(), String> {
+    if !config::has_model_path(&app, &model_path) {
+        return Err("Model is not registered".to_string());
+    }
+    let image = std::path::Path::new(&image_path);
+    if !image.is_file() {
         return Err("Image file not found".to_string());
+    }
+    let valid_extension = image
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp"
+            )
+        })
+        .unwrap_or(false);
+    if !valid_extension {
+        return Err("Unsupported preview image format".to_string());
     }
     config::set_setting(&app, &format!("preview:{}", model_path), &image_path);
     Ok(())

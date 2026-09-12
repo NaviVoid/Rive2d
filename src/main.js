@@ -1,6 +1,6 @@
 import * as PIXI from 'pixi.js';
 import { Assets } from 'pixi.js';
-import { Live2DModel } from 'untitled-pixi-live2d-engine';
+import { Live2DModel, SoundManager } from 'untitled-pixi-live2d-engine';
 
 // Expose PIXI globally for pixi-live2d-display
 window.PIXI = PIXI;
@@ -59,6 +59,7 @@ const app = new PIXI.Application();
 let currentModel = null;
 let showBorder = false;
 let tapMotion = true;
+let rightClickMotion = false;
 let showHitAreas = false;
 let lockModel = false;
 let mouseTracking = true;
@@ -292,6 +293,7 @@ const ready = app.init({
 invoke('get_config').then((config) => {
   showBorder = config.show_border;
   tapMotion = config.tap_motion;
+  rightClickMotion = config.right_click_motion;
   showHitAreas = config.show_hit_areas;
   lockModel = config.lock_model;
   mouseTracking = config.mouse_tracking;
@@ -394,6 +396,9 @@ listen('setting-changed', (event) => {
   }
   if (key === 'tap_motion') {
     tapMotion = value === 'true';
+  }
+  if (key === 'right_click_motion') {
+    rightClickMotion = value === 'true';
   }
   if (key === 'show_hit_areas') {
     showHitAreas = value === 'true';
@@ -540,6 +545,13 @@ function showContextMenu(x, y) {
     toggle: tapMotion,
     action: () => invoke('set_setting', { key: 'tap_motion', value: String(!tapMotion) }),
   }));
+  ctxMenu.appendChild(createMenuItem('Right-click Motions', {
+    toggle: rightClickMotion,
+    action: () => invoke('set_setting', {
+      key: 'right_click_motion',
+      value: String(!rightClickMotion),
+    }),
+  }));
   ctxMenu.appendChild(createMenuItem('Show Hit Areas', {
     toggle: showHitAreas,
     action: () => invoke('set_setting', { key: 'show_hit_areas', value: String(!showHitAreas) }),
@@ -675,6 +687,14 @@ function isDragMotion(mapped) {
   return /drag/i.test(group);
 }
 
+// A drag hit area must not fall through to the ordinary tap-motion handler.
+// Some models map TouchDrag areas to a state/idle group instead of a group
+// whose name contains "drag"; ParamHit areas are drag controls as well.
+function isDragHitArea(name) {
+  if (!name) return false;
+  return /drag/i.test(name) || paramHitItems.some(item => item.hitArea === name);
+}
+
 // Trigger drag motions for hit areas recorded during pointerdown
 function triggerDragMotions() {
   if (!currentModel) return;
@@ -695,7 +715,12 @@ function triggerDragMotions() {
       startDragScrub(name, group, arrayIdx);
       return;
     }
-    // 2. Convention fallbacks: Drag + hitAreaName, drag_ + hitAreaName
+    // 2. Convention fallbacks. TouchDrag1/drag1 are also valid motion group
+    // names, while older models use Drag<HitArea> or drag_<HitArea>.
+    if (/drag/i.test(name) && modelMotions[name]) {
+      startDragScrub(name, name, undefined);
+      return;
+    }
     if (modelMotions['Drag' + name]) {
       startDragScrub(name, 'Drag' + name, undefined);
       return;
@@ -1025,9 +1050,7 @@ function executeOneCommand(cmd) {
     }
     case 'mute_sound': {
       soundMuted = parts[1] === '1';
-      import('untitled-pixi-live2d-engine').then(mod => {
-        if (mod.SoundManager) mod.SoundManager.volume = soundMuted ? 0 : 1;
-      }).catch(() => {});
+      SoundManager.volume = soundMuted ? 0 : 1;
       break;
     }
     case 'stop_sound': {
@@ -1764,6 +1787,10 @@ async function loadModel(modelPath) {
 
     model.on('pointertap', (e) => {
       lastInteractionTime = Date.now();
+      if (e.button === 2 && !rightClickMotion) {
+        console.log('[touch] pointertap — skipped (right-click motions disabled)');
+        return;
+      }
       if (playingStart) {
         console.log('[touch] pointertap — skipped (start animation playing)');
         playingStart = false;
@@ -1778,6 +1805,10 @@ async function loadModel(modelPath) {
         console.log('[touch] pointertap — no hit area at click position');
       }
       for (const name of hitAreaNames) {
+        if (isDragHitArea(name)) {
+          console.log(`[touch] ${name}: skipped (drag hit area)`);
+          continue;
+        }
         const mapped = hitMotionMap[name];
         // Custom override: __none__ means do nothing
         if (mapped === '__none__') { console.log(`[touch] ${name}: skipped (__none__)`); continue; }
@@ -1828,6 +1859,7 @@ async function loadModel(modelPath) {
 
     currentModel = model;
     showBorder = config.show_border;
+    rightClickMotion = config.right_click_motion;
     showHitAreas = config.show_hit_areas;
     lockModel = config.lock_model;
     mouseTracking = config.mouse_tracking;

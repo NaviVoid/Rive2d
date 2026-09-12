@@ -183,8 +183,7 @@ fn extract_encrypted_lpk(
                 let src = dest_dir.join(renamed);
                 if src.exists() {
                     // Read the model descriptor and rewrite file references
-                    let mut content =
-                        std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
+                    let mut content = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
                     for (old_name, new_name) in &rename_map {
                         content = content.replace(old_name.as_str(), new_name.as_str());
                     }
@@ -192,28 +191,23 @@ fn extract_encrypted_lpk(
                     // Detect Cubism version from content to use correct extension
                     // Cubism 4/3: has "Version" and "FileReferences"
                     // Cubism 2: has "model" and "textures"
-                    let is_cubism3plus = content.contains("\"FileReferences\"")
-                        || content.contains("\"Version\"");
+                    let is_cubism3plus =
+                        content.contains("\"FileReferences\"") || content.contains("\"Version\"");
                     let ext = if is_cubism3plus {
                         "model3.json"
                     } else {
                         "model.json"
                     };
 
-                    let model_name = manifest
-                        .name
-                        .as_deref()
-                        .unwrap_or("model");
-                    let model_filename =
-                        format!("{}.{}", sanitize_filename(model_name), ext);
+                    let model_name = manifest.name.as_deref().unwrap_or("model");
+                    let model_filename = format!("{}.{}", sanitize_filename(model_name), ext);
                     let model_path = dest_dir.join(&model_filename);
                     std::fs::write(&model_path, &content).map_err(|e| e.to_string())?;
 
                     // Remove the original renamed file
                     std::fs::remove_file(&src).ok();
 
-                    model_json_path =
-                        Some(model_path.to_string_lossy().to_string());
+                    model_json_path = Some(model_path.to_string_lossy().to_string());
                 }
             }
         }
@@ -302,9 +296,7 @@ fn detect_extension(data: &[u8]) -> &'static str {
             return "ogg";
         }
         // MP3: FF FB or FF F3 or FF F2, or ID3 tag
-        if (data[0] == 0xFF && (data[1] & 0xE0) == 0xE0)
-            || (data[..3] == [0x49, 0x44, 0x33])
-        {
+        if (data[0] == 0xFF && (data[1] & 0xE0) == 0xE0) || (data[..3] == [0x49, 0x44, 0x33]) {
             return "mp3";
         }
         // JPEG: FF D8 FF

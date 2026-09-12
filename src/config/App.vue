@@ -9,6 +9,7 @@ const models = ref([]);
 const currentModel = ref(null);
 const showBorder = ref(false);
 const tapMotion = ref(true);
+const rightClickMotion = ref(false);
 const showHitAreas = ref(false);
 const lockModel = ref(false);
 const mouseTracking = ref(true);
@@ -102,6 +103,7 @@ async function refreshConfig() {
     currentModel.value = config.current_model;
     showBorder.value = config.show_border;
     tapMotion.value = config.tap_motion;
+    rightClickMotion.value = config.right_click_motion;
     showHitAreas.value = config.show_hit_areas;
     lockModel.value = config.lock_model;
     mouseTracking.value = config.mouse_tracking;
@@ -186,6 +188,14 @@ async function toggleTapMotion() {
   await invoke('set_setting', {
     key: 'tap_motion',
     value: tapMotion.value ? 'true' : 'false',
+  });
+}
+
+async function toggleRightClickMotion() {
+  rightClickMotion.value = !rightClickMotion.value;
+  await invoke('set_setting', {
+    key: 'right_click_motion',
+    value: rightClickMotion.value ? 'true' : 'false',
   });
 }
 
@@ -377,6 +387,12 @@ onMounted(() => {
           <div class="toggle-knob" />
         </div>
       </div>
+      <div class="setting-row" @click="toggleRightClickMotion">
+        <span class="setting-label">Enable right-click motions</span>
+        <div class="toggle" :class="{ on: rightClickMotion }">
+          <div class="toggle-knob" />
+        </div>
+      </div>
       <div class="setting-row" @click="toggleHitAreas">
         <span class="setting-label">Show hit areas</span>
         <div class="toggle" :class="{ on: showHitAreas }">
@@ -400,10 +416,15 @@ onMounted(() => {
 </template>
 
 <style>
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
 html, body {
   margin: 0;
   padding: 0;
   height: 100%;
+  overflow: hidden;
 }
 </style>
 
@@ -412,11 +433,14 @@ html, body {
   font-family: system-ui, -apple-system, sans-serif;
   background: #1e1e2e;
   color: #cdd6f4;
-  min-height: 100vh;
-  padding: 24px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 2.4%;
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 2%;
+  overflow: hidden;
 }
 
 header {
@@ -537,12 +561,13 @@ button {
   gap: 8px;
   overflow-y: auto;
   flex: 1;
+  min-height: 0;
 }
 
 .model-card {
   display: flex;
   align-items: center;
-  padding: 14px 16px;
+  padding: 1.4% 1.6%;
   background: #313244;
   border: 1px solid #45475a;
   border-radius: 10px;
@@ -551,8 +576,9 @@ button {
 }
 
 .model-preview {
-  width: 120px;
-  height: 120px;
+  width: clamp(72px, 18%, 120px);
+  height: auto;
+  aspect-ratio: 1;
   border-radius: 8px;
   overflow: hidden;
   background: #1e1e2e;
@@ -659,6 +685,8 @@ button {
 
 .settings-panel {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .setting-row {
@@ -709,6 +737,8 @@ button {
   flex-direction: column;
   gap: 20px;
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .back-btn {
@@ -730,8 +760,9 @@ button {
 }
 
 .detail-preview {
-  width: 140px;
-  height: 140px;
+  width: clamp(96px, 24%, 140px);
+  height: auto;
+  aspect-ratio: 1;
   border-radius: 10px;
   overflow: hidden;
   background: #313244;
@@ -808,11 +839,16 @@ button {
   padding: 8px 12px;
   background: #313244;
   border-radius: 6px;
+  gap: 8px;
 }
 
 .motion-label {
   font-size: 13px;
   color: #cdd6f4;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .motion-select {
@@ -823,7 +859,8 @@ button {
   color: #cdd6f4;
   font-size: 13px;
   outline: none;
-  min-width: 160px;
+  width: clamp(100px, 30%, 160px);
+  min-width: 0;
 }
 
 .motion-select:focus {
@@ -834,6 +871,7 @@ button {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
 }
 
 .trigger-btn {
