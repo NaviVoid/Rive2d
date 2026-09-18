@@ -71,10 +71,6 @@ Two windows, one Rust backend:
 
 ## Known Issues
 
-- Drag trigger (ParamHit MaxMtn) not working on some models
-- Idle loop animation sometimes stops unexpectedly
-- Clicking a hit area only triggers one motion
-
 ## License
 
 MIT
