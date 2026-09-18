@@ -190,7 +190,25 @@ pub fn has_model_path(app: &tauri::AppHandle, path: &str) -> bool {
 /// Check whether a file belongs to an imported model or is a registered preview.
 /// Canonicalization prevents `..` components and symlinks from escaping the model root.
 pub fn is_allowed_model_asset(app: &tauri::AppHandle, path: &std::path::Path) -> bool {
+    let path_string = path.to_string_lossy();
     let Ok(candidate) = path.canonicalize() else {
+        // LPKs are served from a virtual directory. The archive itself must be
+        // registered, and the requested path must remain below that exact file.
+        if let Some(index) = path_string.find(".lpk/") {
+            let archive_end = index + ".lpk".len();
+            let archive_path = &path_string[..archive_end];
+            if !std::path::Path::new(archive_path).is_file() {
+                return false;
+            }
+            let conn = open_db(app);
+            return conn
+                .query_row(
+                    "SELECT 1 FROM models WHERE path LIKE ?1",
+                    [format!("{}%", archive_path)],
+                    |_| Ok(()),
+                )
+                .is_ok();
+        }
         return false;
     };
     let conn = open_db(app);

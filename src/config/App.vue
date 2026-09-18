@@ -242,7 +242,7 @@ const sortedModels = computed(() => {
 });
 
 function fileName(path) {
-  return path.split('/').pop();
+  return path.split('/').pop().replace(/\.(model3|model)\.json$/i, '');
 }
 
 onMounted(() => {
@@ -352,15 +352,16 @@ onMounted(() => {
           :key="model"
           class="model-card"
           :class="{ active: model === currentModel }"
+          @click="openDetail(model)"
         >
-          <div class="model-preview" @click="uploadPreview(model)" title="Click to set preview image">
+          <div class="model-preview" @click.stop="uploadPreview(model)" title="Click to set preview image">
             <img v-if="previews[model]" :src="previews[model]" alt="preview" />
             <div v-else class="no-preview">+</div>
           </div>
-          <div class="model-info" @click="openDetail(model)" style="cursor: pointer">
+          <div class="model-info">
             <span class="model-name">{{ displayName(model) }}</span>
           </div>
-          <div class="model-actions">
+          <div class="model-actions" @click.stop>
             <span v-if="model === currentModel" class="badge">Active</span>
             <button v-else class="load-btn" @click="loadModel(model)">Load</button>
             <button class="remove-btn" @click="removeModel(model)">Remove</button>

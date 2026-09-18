@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{Read, Seek};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Manifest file name inside LPK archives
 const MANIFEST_NAME: &str = "config.mlve";
@@ -9,47 +9,132 @@ const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_ENTRY_SIZE: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Extract an LPK file to `dest_dir`, returning the path to the .model3.json/.model.json.
+/// Return the virtual model entry used when an LPK is loaded without extraction.
 ///
-/// Handles both regular (unencrypted) LPK files and Live2DViewerEX-style
-/// encrypted LPK files (STM_1_0 / STD_1_0 / STD_2_0 formats).
-pub fn extract_lpk(dest_dir: &Path, lpk_path: &str) -> Result<String, String> {
-    // Clean destination directory to avoid stale files from previous extractions
-    if dest_dir.exists() {
-        std::fs::remove_dir_all(dest_dir).map_err(|e| e.to_string())?;
-    }
-    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+/// The returned path is an absolute filesystem-looking path whose prefix is the
+/// source `.lpk` file. It is resolved by the `model://` protocol, not by the OS.
+pub fn direct_model_path(lpk_path: &str) -> Result<String, String> {
+    let mut archive = open_archive(lpk_path)?;
+    let manifest = read_manifest(&mut archive);
 
+    let entry = match manifest {
+        Some(ref manifest) => encrypted_model_info(lpk_path, &mut archive, manifest)?.0,
+        None => regular_model_entry(&mut archive)?,
+    };
+
+    Ok(virtual_path(lpk_path, &entry))
+}
+
+/// Read a file from a virtual path such as `/tmp/model.lpk/model.model3.json`.
+/// No archive contents are written to disk.
+pub fn read_virtual_asset(path: &str) -> Result<Vec<u8>, String> {
+    let (lpk_path, entry) = split_virtual_path(path).ok_or("Not an LPK virtual path")?;
+    if let Some(preview) = workshop_preview_file(lpk_path) {
+        let preview_name = format!(
+            "__workshop_preview__.{}",
+            preview
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("png")
+        );
+        if entry == preview_name {
+            return std::fs::read(preview).map_err(|e| e.to_string());
+        }
+    }
+    let mut archive = open_archive(lpk_path)?;
+    let manifest = read_manifest(&mut archive);
+
+    let data = match manifest {
+        Some(ref manifest) => {
+            read_encrypted_virtual_asset(lpk_path, entry, &mut archive, manifest)?
+        }
+        None => read_archive_entry(&mut archive, entry)?,
+    };
+    Ok(data)
+}
+
+/// Return the Workshop cover as another virtual asset when the LPK has one.
+pub fn workshop_preview_path(model_path: &str) -> Option<String> {
+    let (lpk_path, _) = split_virtual_path(model_path)?;
+    let preview = workshop_preview_file(lpk_path)?;
+    let extension = preview.extension()?.to_str()?.to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+        return None;
+    }
+    Some(virtual_path(
+        lpk_path,
+        &format!("__workshop_preview__.{}", extension),
+    ))
+}
+
+fn workshop_preview_file(lpk_path: &str) -> Option<PathBuf> {
+    let archive_path = Path::new(lpk_path);
+    let parent = archive_path.parent()?;
+    let config_path = parent.join("config.json");
+    let config = std::fs::read_to_string(config_path).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&config).ok()?;
+    let preview_file = config.get("previewFile")?.as_str()?;
+    if preview_file.is_empty() {
+        return None;
+    }
+    let parent = parent.canonicalize().ok()?;
+    let preview = parent.join(preview_file).canonicalize().ok()?;
+    if !preview.starts_with(&parent) || !preview.is_file() {
+        return None;
+    }
+    Some(preview)
+}
+
+/// Split a virtual path at the first `.lpk/` boundary.
+pub fn split_virtual_path(path: &str) -> Option<(&str, &str)> {
+    let marker = ".lpk/";
+    let index = path.find(marker)?;
+    let lpk_end = index + ".lpk".len();
+    let lpk_path = &path[..lpk_end];
+    let entry = &path[lpk_end + 1..];
+    if Path::new(lpk_path).is_absolute() && !entry.is_empty() {
+        Some((lpk_path, entry))
+    } else {
+        None
+    }
+}
+
+pub fn virtual_path(lpk_path: &str, entry: &str) -> String {
+    format!("{}/{}", lpk_path.trim_end_matches('/'), entry)
+}
+
+pub fn join_virtual_path(model_path: &str, relative: &str) -> Option<String> {
+    let (lpk_path, entry) = split_virtual_path(model_path)?;
+    let parent = Path::new(entry).parent()?.to_string_lossy();
+    let joined = if parent == "." {
+        PathBuf::from(relative)
+    } else {
+        Path::new(parent.as_ref()).join(relative)
+    };
+    let joined = joined.to_string_lossy().replace('\\', "/");
+    if joined.starts_with('/') || joined.split('/').any(|part| part == "..") {
+        return None;
+    }
+    Some(virtual_path(lpk_path, &joined))
+}
+
+fn open_archive(lpk_path: &str) -> Result<zip::ZipArchive<std::fs::File>, String> {
     let file = std::fs::File::open(lpk_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
     validate_archive(&mut archive)?;
+    Ok(archive)
+}
 
-    // Try to find the manifest (config.mlve or its MD5-hashed name)
-    let manifest = read_manifest(&mut archive);
-
-    match manifest {
-        Some(manifest) => extract_encrypted_lpk(dest_dir, lpk_path, &mut archive, &manifest),
-        None => extract_regular_lpk(dest_dir, &mut archive),
+fn regular_model_entry<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<String, String> {
+    for index in 0..archive.len() {
+        let file = archive.by_index(index).map_err(|e| e.to_string())?;
+        let name = file.name().to_string();
+        if name.ends_with(".model3.json") || name.ends_with(".model.json") {
+            return Ok(name);
+        }
     }
+    Err("No .model3.json or .model.json found in archive".to_string())
 }
-
-// ---------------------------------------------------------------------------
-// Regular (unencrypted) LPK
-// ---------------------------------------------------------------------------
-
-fn extract_regular_lpk(
-    dest_dir: &Path,
-    archive: &mut zip::ZipArchive<std::fs::File>,
-) -> Result<String, String> {
-    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
-    archive.extract(dest_dir).map_err(|e| e.to_string())?;
-    find_model_json(dest_dir)
-        .ok_or_else(|| "No .model3.json or .model.json found in archive".to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Encrypted LPK (Live2DViewerEX)
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 struct MlveManifest {
@@ -97,123 +182,163 @@ struct ExternalConfig {
     meta_data: String,
 }
 
-fn extract_encrypted_lpk(
-    dest_dir: &Path,
+/// Return the generated virtual descriptor name and its encrypted archive entry.
+fn encrypted_model_info(
     lpk_path: &str,
     archive: &mut zip::ZipArchive<std::fs::File>,
     manifest: &MlveManifest,
-) -> Result<String, String> {
-    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+) -> Result<(String, String), String> {
+    let rename_map = encrypted_rename_map(lpk_path, archive, manifest)?;
+    for character in &manifest.list {
+        for costume in &character.costume {
+            if !rename_map.contains_key(&costume.path) {
+                continue;
+            }
+            let data = read_encrypted_entry(lpk_path, archive, manifest, &costume.path)?;
+            let text = std::str::from_utf8(&data).map_err(|e| e.to_string())?;
+            let ext = if text.contains("\"FileReferences\"") || text.contains("\"Version\"") {
+                "model3.json"
+            } else {
+                "model.json"
+            };
+            let model_name = sanitize_filename(manifest.name.as_deref().unwrap_or("model"));
+            let model_name = if model_name.is_empty() {
+                "model"
+            } else {
+                &model_name
+            };
+            return Ok((format!("{}.{}", model_name, ext), costume.path.clone()));
+        }
+    }
+    Err("No model descriptor found in encrypted LPK".to_string())
+}
 
-    let is_encrypted = manifest
-        .encrypt
-        .as_deref()
-        .map(|s| s == "true")
-        .unwrap_or(false);
-
-    let is_stm = manifest
+fn encrypted_rename_map(
+    lpk_path: &str,
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    manifest: &MlveManifest,
+) -> Result<HashMap<String, String>, String> {
+    let ext_config = if manifest
         .format_type
         .as_deref()
-        .map(|t| t.starts_with("STM"))
-        .unwrap_or(false);
-
-    // Load external config.json for STM format
-    let ext_config = if is_stm {
+        .is_some_and(|format| format.starts_with("STM"))
+    {
         load_external_config(lpk_path)
     } else {
         ExternalConfig::default()
     };
-
+    let is_encrypted = manifest
+        .encrypt
+        .as_deref()
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    let is_stm = manifest
+        .format_type
+        .as_deref()
+        .map(|format| format.starts_with("STM"))
+        .unwrap_or(false);
     let model_id = manifest.id.as_deref().unwrap_or("");
-
-    // Collect all encrypted entry names from the archive
-    let entry_names: Vec<String> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
-        .collect();
-
-    // Decrypt all .bin3/.bin files and track renamed files
-    let mut rename_map: HashMap<String, String> = HashMap::new();
     let manifest_hash = format!("{:x}", md5::compute(MANIFEST_NAME.as_bytes()));
+    let mut rename_map = HashMap::new();
 
-    for entry_name in &entry_names {
-        // Skip the manifest file
+    let entry_names: Vec<String> = (0..archive.len())
+        .filter_map(|index| {
+            archive
+                .by_index(index)
+                .ok()
+                .map(|file| file.name().to_string())
+        })
+        .collect();
+    for entry_name in entry_names {
         if entry_name == MANIFEST_NAME
-            || entry_name == &manifest_hash
-            || entry_name == &format!("{}.bin", manifest_hash)
+            || entry_name == manifest_hash
+            || entry_name == format!("{}.bin", manifest_hash)
+            || !is_hashed_entry(&entry_name)
         {
             continue;
         }
-
-        // Check if this is an encrypted entry (32 hex chars + .bin3 or .bin)
-        let is_encrypted_entry = is_hashed_entry(entry_name);
-
-        let mut data = read_archive_entry(archive, entry_name)?;
-
-        if is_encrypted && is_encrypted_entry {
-            let key = derive_key(model_id, &ext_config, entry_name, is_stm);
+        let mut data = read_archive_entry(archive, &entry_name)?;
+        if is_encrypted {
+            let key = derive_key(model_id, &ext_config, &entry_name, is_stm);
             decrypt_lcg_xor(&mut data, key);
         }
+        let stem = entry_name
+            .strip_suffix(".bin3")
+            .or_else(|| entry_name.strip_suffix(".bin"))
+            .unwrap_or(&entry_name);
+        let output_name = format!("{}.{}", stem, detect_extension(&data));
+        rename_map.insert(entry_name, output_name);
+    }
+    Ok(rename_map)
+}
 
-        // Determine output filename based on file type detection
-        let out_name = if is_encrypted_entry {
-            let ext = detect_extension(&data);
-            let stem = entry_name
-                .strip_suffix(".bin3")
-                .or_else(|| entry_name.strip_suffix(".bin"))
-                .unwrap_or(entry_name);
-            let new_name = format!("{}.{}", stem, ext);
-            rename_map.insert(entry_name.clone(), new_name.clone());
-            new_name
+fn read_encrypted_entry(
+    lpk_path: &str,
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    manifest: &MlveManifest,
+    entry_name: &str,
+) -> Result<Vec<u8>, String> {
+    let mut data = read_archive_entry(archive, entry_name)?;
+    if manifest
+        .encrypt
+        .as_deref()
+        .map(|value| value == "true")
+        .unwrap_or(false)
+        && is_hashed_entry(entry_name)
+    {
+        let is_stm = manifest
+            .format_type
+            .as_deref()
+            .map(|format| format.starts_with("STM"))
+            .unwrap_or(false);
+        let ext_config = if is_stm {
+            load_external_config(lpk_path)
         } else {
-            entry_name.clone()
+            ExternalConfig::default()
         };
+        let key = derive_key(
+            manifest.id.as_deref().unwrap_or(""),
+            &ext_config,
+            entry_name,
+            is_stm,
+        );
+        decrypt_lcg_xor(&mut data, key);
+    }
+    Ok(data)
+}
 
-        let out_path = dest_dir.join(&out_name);
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+fn read_encrypted_virtual_asset(
+    lpk_path: &str,
+    requested_entry: &str,
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    manifest: &MlveManifest,
+) -> Result<Vec<u8>, String> {
+    let (model_entry, costume_entry) = encrypted_model_info(lpk_path, archive, manifest)?;
+    if requested_entry == model_entry {
+        let mut content = String::from_utf8(read_encrypted_entry(
+            lpk_path,
+            archive,
+            manifest,
+            &costume_entry,
+        )?)
+        .map_err(|e| e.to_string())?;
+        let rename_map = encrypted_rename_map(lpk_path, archive, manifest)?;
+        for (old_name, new_name) in rename_map {
+            content = content.replace(&old_name, &new_name);
         }
-        std::fs::write(&out_path, &data).map_err(|e| e.to_string())?;
+        return Ok(content.into_bytes());
     }
 
-    // Find the costume file (model descriptor) and save with correct extension
-    let mut model_json_path = None;
-    for character in &manifest.list {
-        for costume in &character.costume {
-            if let Some(renamed) = rename_map.get(&costume.path) {
-                let src = dest_dir.join(renamed);
-                if src.exists() {
-                    // Read the model descriptor and rewrite file references
-                    let mut content = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
-                    for (old_name, new_name) in &rename_map {
-                        content = content.replace(old_name.as_str(), new_name.as_str());
-                    }
-
-                    // Detect Cubism version from content to use correct extension
-                    // Cubism 4/3: has "Version" and "FileReferences"
-                    // Cubism 2: has "model" and "textures"
-                    let is_cubism3plus =
-                        content.contains("\"FileReferences\"") || content.contains("\"Version\"");
-                    let ext = if is_cubism3plus {
-                        "model3.json"
-                    } else {
-                        "model.json"
-                    };
-
-                    let model_name = manifest.name.as_deref().unwrap_or("model");
-                    let model_filename = format!("{}.{}", sanitize_filename(model_name), ext);
-                    let model_path = dest_dir.join(&model_filename);
-                    std::fs::write(&model_path, &content).map_err(|e| e.to_string())?;
-
-                    // Remove the original renamed file
-                    std::fs::remove_file(&src).ok();
-
-                    model_json_path = Some(model_path.to_string_lossy().to_string());
-                }
-            }
-        }
+    let rename_map = encrypted_rename_map(lpk_path, archive, manifest)?;
+    if let Some((archive_entry, _)) = rename_map
+        .iter()
+        .find(|(_, output_name)| output_name.as_str() == requested_entry)
+    {
+        return read_encrypted_entry(lpk_path, archive, manifest, archive_entry);
     }
 
-    model_json_path.ok_or_else(|| "No model descriptor found in encrypted LPK".to_string())
+    // Non-hashed entries are stored under their original names.
+    read_encrypted_entry(lpk_path, archive, manifest, requested_entry)
 }
 
 // ---------------------------------------------------------------------------
@@ -430,28 +555,6 @@ fn decrypt_lcg_xor(data: &mut [u8], key: i64) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Model JSON finder (for regular LPK)
-// ---------------------------------------------------------------------------
-
-pub fn find_model_json(dir: &Path) -> Option<String> {
-    let entries = std::fs::read_dir(dir).ok()?;
-    for entry in entries {
-        let entry = entry.ok()?;
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_model_json(&path) {
-                return Some(found);
-            }
-        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.ends_with(".model3.json") || name.ends_with(".model.json") {
-                return Some(path.to_string_lossy().to_string());
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,8 +591,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let archive_path = root.join("malicious.lpk");
-        let dest = root.join("model");
-        let escaped = root.join("escaped.txt");
 
         let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
         writer
@@ -504,9 +605,8 @@ mod tests {
         writer.write_all(b"malicious").unwrap();
         writer.finish().unwrap();
 
-        let error = extract_lpk(&dest, archive_path.to_str().unwrap()).unwrap_err();
+        let error = direct_model_path(archive_path.to_str().unwrap()).unwrap_err();
         assert!(error.starts_with("Unsafe archive path:"));
-        assert!(!escaped.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -531,5 +631,29 @@ mod tests {
         assert_eq!(detect_extension(&[0x4D, 0x4F, 0x43, 0x33, 0x00]), "moc3");
         assert_eq!(detect_extension(b"{\"Version\":3}"), "json");
         assert_eq!(detect_extension(&[0x00, 0x01, 0x02, 0x03]), "bin");
+    }
+
+    #[test]
+    fn direct_workshop_lpk_can_be_read_when_configured() {
+        let Some(path) = std::env::var_os("RIVE2D_TEST_LPK") else {
+            return;
+        };
+        let path = path.to_string_lossy();
+        let model_path = direct_model_path(&path).unwrap();
+        let model = read_virtual_asset(&model_path).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&model).unwrap();
+        assert!(json.get("FileReferences").is_some() || json.get("model").is_some());
+
+        let preview_path = workshop_preview_path(&model_path).unwrap();
+        assert!(!read_virtual_asset(&preview_path).unwrap().is_empty());
+
+        let texture = json
+            .pointer("/FileReferences/Textures/0")
+            .and_then(|value| value.as_str())
+            .or_else(|| json.pointer("/textures/0").and_then(|value| value.as_str()));
+        if let Some(texture) = texture {
+            let texture_path = join_virtual_path(&model_path, texture).unwrap();
+            assert!(!read_virtual_asset(&texture_path).unwrap().is_empty());
+        }
     }
 }

@@ -61,7 +61,12 @@ pub fn run() {
                     .body(b"Access denied".to_vec())
                     .unwrap();
             }
-            match std::fs::read(file_path) {
+            let is_virtual_lpk = lpk::split_virtual_path(&path).is_some();
+            match if is_virtual_lpk {
+                lpk::read_virtual_asset(&path)
+            } else {
+                std::fs::read(file_path).map_err(|e| e.to_string())
+            } {
                 Ok(mut data) => {
                     let mime = match file_path.extension().and_then(|e| e.to_str()) {
                         Some("json") => "application/json",
@@ -333,7 +338,7 @@ async fn add_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
     }
 
     let model_path = match p.extension().and_then(|e| e.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("lpk") => extract_lpk(&app, &path, &hash)?,
+        Some(ext) if ext.eq_ignore_ascii_case("lpk") => lpk::direct_model_path(&path)?,
         Some(ext) if ext.eq_ignore_ascii_case("json") => path,
         _ => return Err("Unsupported format. Use .lpk or .model3.json".to_string()),
     };
@@ -345,42 +350,6 @@ async fn add_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
 fn file_md5(path: &std::path::Path) -> Result<String, String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     Ok(format!("{:x}", md5::compute(&data)))
-}
-
-fn extract_lpk(
-    app: &tauri::AppHandle,
-    lpk_path: &str,
-    source_hash: &str,
-) -> Result<String, String> {
-    let lpk = std::path::Path::new(lpk_path);
-    let stem = lpk
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .ok_or("Invalid file name")?;
-    let safe_stem: String = stem
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let safe_stem = if safe_stem.is_empty() {
-        "model"
-    } else {
-        &safe_stem
-    };
-
-    let models_dir = app
-        .path()
-        .app_data_dir()
-        .expect("Failed to get app data dir")
-        .join("models")
-        .join(format!("{}-{}", safe_stem, source_hash));
-
-    lpk::extract_lpk(&models_dir, lpk_path)
 }
 
 #[derive(serde::Serialize)]
@@ -446,7 +415,7 @@ async fn add_models_from_dir(app: tauri::AppHandle, path: String) -> Result<Impo
             skipped += 1;
             continue;
         }
-        match extract_lpk(&app, &path_str, &hash) {
+        match lpk::direct_model_path(&path_str) {
             Ok(model_path) => {
                 config::add_model(&app, &model_path, Some(&hash));
                 imported += 1;
@@ -504,7 +473,10 @@ fn remove_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn apply_model(app: tauri::AppHandle, path: String) -> Result<(), String> {
-    if !config::has_model_path(&app, &path) || !std::path::Path::new(&path).is_file() {
+    let path_exists = std::path::Path::new(&path).is_file()
+        || lpk::split_virtual_path(&path)
+            .is_some_and(|(archive, _)| std::path::Path::new(archive).is_file());
+    if !config::has_model_path(&app, &path) || !path_exists {
         return Err("Model is not registered or no longer exists".to_string());
     }
     config::set_model(&app, &path);
@@ -574,10 +546,16 @@ fn get_model_preview(app: tauri::AppHandle, path: String) -> Option<String> {
         }
     }
 
+    if let Some(preview) = lpk::workshop_preview_path(&path) {
+        return Some(preview);
+    }
+
     // Fall back to first texture from model JSON
-    let model_path = std::path::Path::new(&path);
-    let dir = model_path.parent()?;
-    let json_str = std::fs::read_to_string(model_path).ok()?;
+    let json_str = if lpk::split_virtual_path(&path).is_some() {
+        String::from_utf8(lpk::read_virtual_asset(&path).ok()?).ok()?
+    } else {
+        std::fs::read_to_string(&path).ok()?
+    };
     let json: serde_json::Value = serde_json::from_str(&json_str).ok()?;
 
     let texture = json
@@ -593,11 +571,16 @@ fn get_model_preview(app: tauri::AppHandle, path: String) -> Option<String> {
                 .and_then(|v| v.as_str())
         })?;
 
-    let abs = dir.join(texture);
-    if abs.exists() {
-        Some(abs.to_string_lossy().into_owned())
+    if let Some(asset) = lpk::join_virtual_path(&path, texture) {
+        Some(asset)
     } else {
-        None
+        let model_path = std::path::Path::new(&path);
+        let abs = model_path.parent()?.join(texture);
+        if abs.exists() {
+            Some(abs.to_string_lossy().into_owned())
+        } else {
+            None
+        }
     }
 }
 
@@ -633,6 +616,10 @@ fn set_model_preview(
 
 #[tauri::command]
 fn load_model(path: String) -> Result<String, String> {
+    if lpk::split_virtual_path(&path).is_some() {
+        return String::from_utf8(lpk::read_virtual_asset(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string());
+    }
     let path = std::path::Path::new(&path);
     if !path.exists() {
         return Err("Model file not found".to_string());
@@ -691,7 +678,12 @@ struct ModelInfo {
 
 #[tauri::command]
 fn get_model_info(app: tauri::AppHandle, path: String) -> Result<ModelInfo, String> {
-    let json_str = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let json_str = if lpk::split_virtual_path(&path).is_some() {
+        String::from_utf8(lpk::read_virtual_asset(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+    } else {
+        std::fs::read_to_string(&path).map_err(|e| e.to_string())?
+    };
     let json: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| e.to_string())?;
 
     let mut hit_areas = Vec::new();

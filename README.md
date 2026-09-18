@@ -15,7 +15,7 @@ Built with Tauri 2 (Rust) + PixiJS 8 + Vue 3. Supports Cubism 2-4 models via `un
 - **ParamHit drag** — drag on hit areas to control Live2D parameters (Live2DViewerEX feature)
 - **Animation system** — idle loop, start animation, motion chaining (NextMtn), random motion selection
 - **Mouse tracking** — model gaze follows the cursor
-- **LPK import** — extract `.lpk` packages (regular, STM, STD formats)
+- **LPK import** — load `.lpk` packages directly (regular, STM, STD formats; no extraction)
 - **Batch import** — import an entire folder of models at once
 - **Settings window** — model management, custom names, preview images, per-hit-area motion mapping with test buttons
 - **System tray** — quick access to settings and quit
@@ -66,7 +66,7 @@ Two windows, one Rust backend:
 | `lib.rs`         | Tauri commands, `model://` protocol, config window |
 | `layer_shell.rs` | Wayland layer-shell overlay + GDK input regions    |
 | `config.rs`      | SQLite config storage                              |
-| `lpk.rs`         | LPK archive extraction and decryption              |
+| `lpk.rs`         | LPK archive reading and decryption                 |
 | `tray.rs`        | System tray menu                                   |
 
 ## Known Issues
