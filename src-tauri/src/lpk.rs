@@ -1,12 +1,14 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 /// Manifest file name inside LPK archives
 const MANIFEST_NAME: &str = "config.mlve";
+const EXTRACTION_CACHE_VERSION: &str = "v2";
+const EXTRACTION_CACHE_MARKER: &[u8] = b"rive2d-extraction-cache-v2";
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_ENTRY_SIZE: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_SIZE: u64 = 2 * 1024 * 1024 * 1024;
@@ -14,7 +16,19 @@ const MAX_TOTAL_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ArchiveFingerprint {
     length: u64,
-    modified: Option<SystemTime>,
+    modified_ns: Option<u128>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersistentCacheEntry {
+    length: u64,
+    modified_ns: Option<u128>,
+    key: String,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct PersistentCacheIndex {
+    entries: HashMap<String, PersistentCacheEntry>,
 }
 
 struct RenameMapCacheEntry {
@@ -22,8 +36,13 @@ struct RenameMapCacheEntry {
     map: HashMap<String, String>,
 }
 
+type ExternalConfigCacheValue = (Option<ArchiveFingerprint>, ExternalConfig);
+
 static RENAME_MAP_CACHE: OnceLock<Mutex<HashMap<String, RenameMapCacheEntry>>> = OnceLock::new();
 static EXTRACTION_CACHE_PATHS: OnceLock<Mutex<HashMap<String, (ArchiveFingerprint, PathBuf)>>> =
+    OnceLock::new();
+static EXTRACTION_INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static EXTERNAL_CONFIG_CACHE: OnceLock<Mutex<HashMap<String, ExternalConfigCacheValue>>> =
     OnceLock::new();
 
 /// Return the virtual model entry used when an LPK is loaded without extraction.
@@ -141,24 +160,94 @@ fn marker_path(root: &Path) -> PathBuf {
     root.join(".complete")
 }
 
+fn cache_is_complete(root: &Path) -> bool {
+    std::fs::read(marker_path(root))
+        .map(|data| data == EXTRACTION_CACHE_MARKER)
+        .unwrap_or(false)
+}
+
+fn extraction_index_path(root: &Path) -> PathBuf {
+    root.join("index.json")
+}
+
+fn read_persistent_cache_index(root: &Path) -> PersistentCacheIndex {
+    std::fs::read(extraction_index_path(root))
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok())
+        .unwrap_or_default()
+}
+
+fn write_persistent_cache_index(root: &Path, index: &PersistentCacheIndex) {
+    let path = extraction_index_path(root);
+    let temporary = root.join(".index.json.tmp");
+    let Ok(data) = serde_json::to_vec(index) else {
+        return;
+    };
+    if std::fs::write(&temporary, data).is_ok() {
+        let _ = std::fs::rename(temporary, path);
+    }
+}
+
+fn remember_persistent_cache(
+    root: &Path,
+    lpk_path: &str,
+    fingerprint: ArchiveFingerprint,
+    key: &str,
+) {
+    let lock = EXTRACTION_INDEX_LOCK.get_or_init(|| Mutex::new(()));
+    let Ok(_guard) = lock.lock() else {
+        return;
+    };
+    let mut index = read_persistent_cache_index(root);
+    index.entries.insert(
+        lpk_path.to_string(),
+        PersistentCacheEntry {
+            length: fingerprint.length,
+            modified_ns: fingerprint.modified_ns,
+            key: key.to_string(),
+        },
+    );
+    write_persistent_cache_index(root, &index);
+}
+
 fn ensure_extraction_cache(lpk_path: &str) -> Result<PathBuf, String> {
     let fingerprint = archive_fingerprint(lpk_path)?;
     let cache_paths = EXTRACTION_CACHE_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(cache) = cache_paths.lock() {
         if let Some((cached_fingerprint, destination)) = cache.get(lpk_path) {
-            if *cached_fingerprint == fingerprint && marker_path(destination).is_file() {
+            if *cached_fingerprint == fingerprint && cache_is_complete(destination) {
                 return Ok(destination.clone());
             }
         }
     }
 
-    // The source is hashed only once per archive version. The hash keeps
-    // stale extractions from being reused after a Workshop file changes.
-    let source = std::fs::read(lpk_path).map_err(|e| e.to_string())?;
-    let key = format!("{:x}", md5::compute(&source));
     let root = extraction_cache_root();
+    if let Ok(_guard) = EXTRACTION_INDEX_LOCK.get_or_init(|| Mutex::new(())).lock() {
+        let index = read_persistent_cache_index(&root);
+        if let Some(entry) = index.entries.get(lpk_path) {
+            if entry.length == fingerprint.length && entry.modified_ns == fingerprint.modified_ns {
+                let destination = root.join(&entry.key);
+                if cache_is_complete(&destination) {
+                    if let Ok(mut cache) = cache_paths.lock() {
+                        cache.insert(lpk_path.to_string(), (fingerprint, destination.clone()));
+                    }
+                    return Ok(destination);
+                }
+            }
+        }
+    }
+
+    // The source is hashed only when the persistent metadata index misses. The
+    // hash keeps stale extractions from being reused after a Workshop file
+    // changes while avoiding a full archive read on normal restarts.
+    let source = std::fs::read(lpk_path).map_err(|e| e.to_string())?;
+    let key = format!("{}-{:x}", EXTRACTION_CACHE_VERSION, md5::compute(&source));
     let destination = root.join(&key);
-    if marker_path(&destination).is_file() {
+    if cache_is_complete(&destination) {
+        remember_persistent_cache(&root, lpk_path, fingerprint, &key);
+        if let Ok(mut cache) = cache_paths.lock() {
+            cache.insert(lpk_path.to_string(), (fingerprint, destination.clone()));
+        }
         return Ok(destination);
     }
 
@@ -191,7 +280,7 @@ fn ensure_extraction_cache(lpk_path: &str) -> Result<PathBuf, String> {
                 &data,
             )?;
         }
-        std::fs::write(marker_path(&temporary), b"rive2d-extraction-cache-v1")
+        std::fs::write(marker_path(&temporary), EXTRACTION_CACHE_MARKER)
             .map_err(|e| e.to_string())?;
         Ok::<(), String>(())
     })();
@@ -205,14 +294,115 @@ fn ensure_extraction_cache(lpk_path: &str) -> Result<PathBuf, String> {
         let _ = std::fs::remove_dir_all(&temporary);
     } else if let Err(error) = std::fs::rename(&temporary, &destination) {
         let _ = std::fs::remove_dir_all(&temporary);
-        if !marker_path(&destination).is_file() {
+        if !cache_is_complete(&destination) {
             return Err(error.to_string());
         }
     }
     if let Ok(mut cache) = cache_paths.lock() {
         cache.insert(lpk_path.to_string(), (fingerprint, destination.clone()));
     }
+    remember_persistent_cache(&root, lpk_path, fingerprint, &key);
     Ok(destination)
+}
+
+/// Return whether a virtual asset is already available in the complete cache.
+/// The protocol uses this to skip compatibility JSON rewriting for prepared
+/// LPK assets.
+pub fn is_cached_virtual_asset(path: &str) -> bool {
+    let Some((lpk_path, entry)) = split_virtual_path(path) else {
+        return false;
+    };
+    let Ok(cache_dir) = ensure_extraction_cache(lpk_path) else {
+        return false;
+    };
+    cache_entry_path(&cache_dir, entry)
+        .map(|cached| cached.is_file())
+        .unwrap_or(false)
+}
+
+/// Apply compatibility fixes once while building the extraction cache. The
+/// WebView should receive stable cached bytes instead of reparsing every JSON
+/// request in the Tauri protocol handler.
+fn preprocess_cached_asset(name: &str, data: Vec<u8>) -> Vec<u8> {
+    if !name.to_ascii_lowercase().ends_with(".json") {
+        return data;
+    }
+    let Ok(text) = std::str::from_utf8(&data) else {
+        return data;
+    };
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text) else {
+        return data;
+    };
+    let mut patched_any = false;
+    let lower_name = name.to_ascii_lowercase();
+
+    if lower_name.ends_with(".model3.json") {
+        if json.get("FileReferences").is_some() && json.get("Groups").is_none() {
+            json["Groups"] = serde_json::json!([]);
+            patched_any = true;
+        }
+        if let Some(textures) = json
+            .pointer_mut("/FileReferences/Textures")
+            .and_then(|value| value.as_array_mut())
+        {
+            let before = textures.len();
+            textures.retain(|value| value.as_str().is_none_or(|item| !item.is_empty()));
+            if textures.len() != before {
+                patched_any = true;
+            }
+        }
+    }
+
+    if json
+        .get("Meta")
+        .and_then(|meta| meta.get("TotalPointCount"))
+        .is_some()
+        && json
+            .get("Curves")
+            .and_then(|curves| curves.as_array())
+            .is_some()
+    {
+        let mut total_points = 0u64;
+        let mut total_segments = 0u64;
+        if let Some(curves) = json.get("Curves").and_then(|value| value.as_array()) {
+            for curve in curves {
+                let Some(segments) = curve.get("Segments").and_then(|value| value.as_array())
+                else {
+                    continue;
+                };
+                if segments.len() < 2 {
+                    continue;
+                }
+                total_points += 1;
+                let mut index = 2;
+                while index < segments.len() {
+                    let segment_type = segments[index].as_f64().unwrap_or(-1.0) as i64;
+                    match segment_type {
+                        0 | 2 | 3 => {
+                            total_points += 1;
+                            total_segments += 1;
+                            index += 3;
+                        }
+                        1 => {
+                            total_points += 3;
+                            total_segments += 1;
+                            index += 7;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        json["Meta"]["TotalPointCount"] = serde_json::json!(total_points);
+        json["Meta"]["TotalSegmentCount"] = serde_json::json!(total_segments);
+        patched_any = true;
+    }
+
+    if patched_any {
+        serde_json::to_vec(&json).unwrap_or(data)
+    } else {
+        data
+    }
 }
 
 fn extract_regular_archive(
@@ -231,7 +421,7 @@ fn extract_regular_archive(
         if name.ends_with('/') {
             continue;
         }
-        let data = read_archive_entry(archive, &name)?;
+        let data = preprocess_cached_asset(&name, read_archive_entry(archive, &name)?);
         write_cached_asset(destination, &name, &data)?;
     }
     Ok(())
@@ -263,7 +453,10 @@ fn extract_encrypted_archive(
             continue;
         }
         let output_name = rename_map.get(&name).map(String::as_str).unwrap_or(&name);
-        let data = read_encrypted_entry(lpk_path, archive, manifest, &name)?;
+        let data = preprocess_cached_asset(
+            output_name,
+            read_encrypted_entry(lpk_path, archive, manifest, &name)?,
+        );
         write_cached_asset(destination, output_name, &data)?;
     }
 
@@ -280,7 +473,8 @@ fn extract_encrypted_archive(
     for (old_name, new_name) in rename_map {
         model = model.replace(&old_name, &new_name);
     }
-    write_cached_asset(destination, &model_name, model.as_bytes())?;
+    let model = preprocess_cached_asset(&model_name, model.into_bytes());
+    write_cached_asset(destination, &model_name, &model)?;
     Ok(())
 }
 
@@ -405,7 +599,7 @@ struct MlveCostume {
 }
 
 /// External config.json that accompanies STM-format LPK files
-#[derive(Debug, Deserialize, Default)]
+#[derive(Clone, Debug, Deserialize, Default)]
 struct ExternalConfig {
     #[serde(rename = "fileId", default)]
     file_id: String,
@@ -535,7 +729,11 @@ fn archive_fingerprint(lpk_path: &str) -> Result<ArchiveFingerprint, String> {
     let metadata = std::fs::metadata(lpk_path).map_err(|e| e.to_string())?;
     Ok(ArchiveFingerprint {
         length: metadata.len(),
-        modified: metadata.modified().ok(),
+        modified_ns: metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos()),
     })
 }
 
@@ -773,20 +971,48 @@ fn read_archive_entry(
 // ---------------------------------------------------------------------------
 
 fn load_external_config(lpk_path: &str) -> ExternalConfig {
+    let cache = EXTERNAL_CONFIG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let lpk = Path::new(lpk_path);
-    if let Some(parent) = lpk.parent() {
-        let config_path = parent.join("config.json");
-        if config_path.exists() {
-            if let Ok(data) = std::fs::read_to_string(&config_path) {
-                if let Ok(config) = serde_json::from_str::<ExternalConfig>(&data) {
-                    eprintln!("[rive2d] Loaded external config.json for STM decryption");
-                    return config;
-                }
+    let config_path = lpk.parent().map(|parent| parent.join("config.json"));
+    let fingerprint = config_path.as_ref().and_then(|path| {
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| ArchiveFingerprint {
+                length: metadata.len(),
+                modified_ns: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_nanos()),
+            })
+    });
+    let key = lpk_path.to_string();
+
+    if let Ok(cache) = cache.lock() {
+        if let Some((cached_fingerprint, config)) = cache.get(&key) {
+            if *cached_fingerprint == fingerprint {
+                return config.clone();
             }
         }
     }
-    eprintln!("[rive2d] Warning: No config.json found for STM format LPK, decryption may fail");
-    ExternalConfig::default()
+
+    let config = config_path
+        .as_ref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|data| serde_json::from_str::<ExternalConfig>(&data).ok());
+
+    if config.is_some() {
+        eprintln!("[rive2d] Loaded external config.json for STM decryption");
+    } else {
+        eprintln!(
+            "[rive2d] Warning: No valid config.json found for STM format LPK, decryption may fail"
+        );
+    }
+    let config = config.unwrap_or_default();
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, (fingerprint, config.clone()));
+    }
+    config
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +1127,32 @@ mod tests {
     }
 
     #[test]
+    fn preprocess_cached_motion_recalculates_curve_metadata() {
+        let source = br#"{
+            "Meta": {"TotalPointCount": 999, "TotalSegmentCount": 999},
+            "Curves": [{"Segments": [0, 0, 0, 0, 0, 0, 0, 0]}]
+        }"#;
+        let processed = preprocess_cached_asset("motions/test.motion3.json", source.to_vec());
+        let json: serde_json::Value = serde_json::from_slice(&processed).unwrap();
+        assert_eq!(json["Meta"]["TotalPointCount"], 3);
+        assert_eq!(json["Meta"]["TotalSegmentCount"], 2);
+    }
+
+    #[test]
+    fn preprocess_cached_model_adds_groups_and_removes_empty_texture() {
+        let source = br#"{
+            "FileReferences": {"Textures": ["", "texture_00.png"]}
+        }"#;
+        let processed = preprocess_cached_asset("model.model3.json", source.to_vec());
+        let json: serde_json::Value = serde_json::from_slice(&processed).unwrap();
+        assert_eq!(json["Groups"], serde_json::json!([]));
+        assert_eq!(
+            json["FileReferences"]["Textures"],
+            serde_json::json!(["texture_00.png"])
+        );
+    }
+
+    #[test]
     fn direct_workshop_lpk_can_be_read_when_configured() {
         let Some(path) = std::env::var_os("RIVE2D_TEST_LPK") else {
             return;
@@ -925,8 +1177,7 @@ mod tests {
 
         if cfg!(debug_assertions) {
             let cache = ensure_extraction_cache(&path).unwrap();
-            assert!(marker_path(&cache).is_file());
-            assert!(cache.join(".complete").is_file());
+            assert!(cache_is_complete(&cache));
         }
     }
 }

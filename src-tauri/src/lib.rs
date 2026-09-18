@@ -62,6 +62,7 @@ pub fn run() {
                     .unwrap();
             }
             let is_virtual_lpk = lpk::split_virtual_path(&path).is_some();
+            let is_preprocessed_lpk_asset = is_virtual_lpk && lpk::is_cached_virtual_asset(&path);
             match if is_virtual_lpk {
                 lpk::read_virtual_asset(&path)
             } else {
@@ -81,7 +82,7 @@ pub fn run() {
                     };
 
                     // Patch model3.json
-                    if path.ends_with(".model3.json") {
+                    if path.ends_with(".model3.json") && !is_preprocessed_lpk_asset {
                         if let Ok(text) = std::str::from_utf8(&data) {
                             if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text) {
                                 let mut patched_any = false;
@@ -120,7 +121,7 @@ pub fn run() {
                     // Patch motion3.json: fix incorrect TotalPointCount/TotalSegmentCount
                     // LPK-extracted motions have hashed filenames (.json, not .motion3.json),
                     // so detect by content structure rather than extension.
-                    if mime == "application/json" {
+                    if mime == "application/json" && !is_preprocessed_lpk_asset {
                         if let Ok(text) = std::str::from_utf8(&data) {
                             if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text) {
                                 if json

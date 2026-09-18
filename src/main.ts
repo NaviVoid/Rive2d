@@ -6,6 +6,7 @@ import { TauriResourcePreloader } from './interaction/assetPreloader';
 import { Live2DCommandRuntime } from './interaction/commandRuntime';
 import { ConsoleRuntimeLogger } from './interaction/logger';
 import { ModelRuntime } from './interaction/modelRuntime';
+import { MotionResourceCache, type MotionResourceRoute } from './interaction/motionResourceCache';
 
 // Expose PIXI globally for pixi-live2d-display
 window.PIXI = PIXI;
@@ -152,6 +153,7 @@ let extraMotionEnabled = false;
 let eyeBlinkSave = null;       // saved eyeBlink reference for enable/disable
 let physicsSave = null;        // saved physics reference for enable/disable
 let soundMuted = false;
+let motionResourceCache = null;
 
 const live2DCommandRuntime = new Live2DCommandRuntime({
   resolveNumber(rawValue) {
@@ -1076,27 +1078,136 @@ function finiteNumber(value, fallback) {
   return Number.isFinite(number) ? number : fallback;
 }
 
-async function preloadModelMotions(model) {
-  const manager = model.internalModel.motionManager;
-  const definitions = manager.definitions || {};
-  const tasks = [];
+function collectMotionPreloadRoutes(model, includeInteractive = false): MotionResourceRoute[] {
+  const rawJson = model.internalModel.settings.json;
+  const metadata = normalizeModelMetadata(rawJson);
+  const groups = Object.keys(metadata.motions);
+  const groupByName = new Map(groups.map(group => [group.toLowerCase(), group]));
+  const routes = new Map<string, MotionResourceRoute>();
+  const queue = [];
 
-  for (const [group, entries] of Object.entries(definitions)) {
-    if (!Array.isArray(entries)) continue;
-    for (let index = 0; index < entries.length; index += 1) {
-      tasks.push(manager.loadMotion(group, index));
+  const resolve = reference => {
+    if (typeof reference !== 'string' || !reference.trim()) return null;
+    const separator = reference.indexOf(':');
+    const rawGroup = separator < 0 ? reference.trim() : reference.slice(0, separator).trim();
+    const suffix = separator < 0 ? undefined : reference.slice(separator + 1).trim();
+    const group = groupByName.get(rawGroup.toLowerCase());
+    if (!group) return null;
+    const entries = metadata.motions[group] || [];
+    let index;
+    if (suffix !== undefined && /^\d+$/.test(suffix)) {
+      index = Number(suffix);
+    } else if (suffix !== undefined) {
+      index = entries.findIndex(entry => String(entry.Name || '').toLowerCase() === suffix.toLowerCase());
+    }
+    if (index === undefined) return null;
+    if (!entries[index]?.File) return { group, index };
+    return { group, index };
+  };
+
+  const enqueue = reference => {
+    if (typeof reference === 'string' && !reference.includes(':')) {
+      const group = groupByName.get(reference.trim().toLowerCase());
+      if (group) {
+        for (let index = 0; index < metadata.motions[group].length; index += 1) {
+          if (metadata.motions[group][index]?.File) enqueue({ group, index });
+        }
+        return;
+      }
+    }
+    const route = typeof reference === 'string' ? resolve(reference) : reference;
+    if (!route || !Number.isInteger(route.index)) return;
+    const key = `${route.group}:${route.index}`;
+    if (!routes.has(key)) {
+      routes.set(key, route);
+      queue.push(route);
+    }
+  };
+
+  const enqueueCommandRoutes = command => {
+    if (typeof command !== 'string') return;
+    for (const part of command.split(';')) {
+      const match = part.trim().match(/^start_mtn\s+(.+)$/i);
+      if (match) enqueue(match[1].trim());
+    }
+  };
+
+  // Only the current Idle entry and the model init chain are on the startup
+  // critical path. Other Idle variants and interaction routes can be loaded
+  // through the same cache when they are actually selected.
+  const defaultIdleGroup = groupByName.get('idle')
+    || groups.find(group => /^idle$/i.test(group));
+  if (defaultIdleGroup) {
+    const entries = metadata.motions[defaultIdleGroup] || [];
+    const defaultIndex = entries.findIndex(entry => (
+      Array.isArray(entry.VarFloats)
+      && entry.VarFloats.some(item => /\bequal\s+0\b/i.test(String(item.Code || '')))
+    ));
+    const index = defaultIndex >= 0 ? defaultIndex : 0;
+    if (entries[index]?.File) enqueue({ group: defaultIdleGroup, index });
+  }
+
+  for (const [group, entries] of Object.entries(metadata.motions)) {
+    entries.forEach((entry, index) => {
+      if (String(entry.Name || '').toLowerCase() === 'init') enqueue({ group, index });
+    });
+  }
+
+  if (includeInteractive) {
+    // Explicit hit-area routes are the primary interactive entry points.
+    for (const area of metadata.hitAreas) {
+      enqueue(area.Motion);
+      const name = String(area.Name || '');
+      for (const candidate of [`tap_${name}`, name, `Tap${name}`, name.replace(/^Touch/i, '').toLowerCase()]) {
+        if (resolve(candidate)) enqueue(candidate);
+      }
+    }
+
+    // Controller fields use several names across model versions. Only fields
+    // explicitly describing a motion route are included in the preload graph.
+    const collectControllerRoutes = value => {
+      if (Array.isArray(value)) {
+        value.forEach(collectControllerRoutes);
+        return;
+      }
+      if (!value || typeof value !== 'object') return;
+      for (const [key, item] of Object.entries(value)) {
+        if (typeof item === 'string' && /(mtn|motion)$/i.test(key)) enqueue(item);
+        else collectControllerRoutes(item);
+      }
+    };
+    collectControllerRoutes(rawJson.Controllers || rawJson.controllers);
+  }
+
+  // Follow the behavior graph so command-only options and chained actions are
+  // ready before their parent interaction starts.
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const route = queue[cursor];
+    const entry = metadata.motions[route.group]?.[route.index];
+    if (!entry) continue;
+    enqueue(entry.NextMtn);
+    enqueueCommandRoutes(entry.Command);
+    enqueueCommandRoutes(entry.PostCommand);
+    if (Array.isArray(entry.Choices)) {
+      for (const choice of entry.Choices) enqueue(choice?.NextMtn);
     }
   }
 
-  const startedAt = performance.now();
-  const motions = await Promise.all(tasks);
-  const loaded = motions.filter(Boolean).length;
-  const failed = motions.length - loaded;
-  traceLog('motion', 'preload-complete', {
-    requested: motions.length,
-    loaded,
-    failed,
-    elapsedMs: Math.round(performance.now() - startedAt),
+  return [...routes.values()].filter(route => Boolean(metadata.motions[route.group]?.[route.index]?.File));
+}
+
+async function preloadModelMotions(model) {
+  const manager = model.internalModel.motionManager;
+  motionResourceCache = new MotionResourceCache(
+    (group, index) => manager.loadMotion(group, index),
+    interactionLogger,
+  );
+  const routes = collectMotionPreloadRoutes(model);
+  const result = await motionResourceCache.preload(routes, 2);
+  traceLog('motion', 'critical-preload-complete', {
+    ...result,
+    totalDefinitions: Object.values(manager.definitions || {})
+      .reduce((total, entries) => total + (Array.isArray(entries) ? entries.length : 0), 0),
   });
 }
 
@@ -1413,7 +1524,14 @@ function playMotion(group, index, priority) {
   });
   // Pass loop explicitly because the engine otherwise falls back to the
   // motion file's Meta.Loop value, which is true for many one-shot clips.
-  const request = currentModel.motion(group, index, motionPriority, { loop: shouldLoop });
+  const startMotion = () => {
+    if (!currentModel) return Promise.resolve(false);
+    return currentModel.motion(group, index, motionPriority, { loop: shouldLoop });
+  };
+  const resourceReady = entry?.File && index !== undefined && motionResourceCache
+    ? motionResourceCache.load({ group, index })
+    : Promise.resolve(true);
+  const request = resourceReady.then(startMotion);
   return Promise.resolve(request).then(started => {
     traceLog('motion', 'request-result', { requestId, started });
     if (!started) {
@@ -2147,6 +2265,8 @@ async function loadModel(modelPath) {
   if (currentModel) {
     appRuntime.detachModel();
     modelRuntime = null;
+    motionResourceCache?.clear();
+    motionResourceCache = null;
     app.ticker.remove(drawHitAreas);
     hitAreaGfx.clear();
     for (const label of hitAreaLabels) label.visible = false;
@@ -2183,9 +2303,11 @@ async function loadModel(modelPath) {
       elapsedMs: Math.round(performance.now() - modelStartedAt),
     });
 
+    const criticalPreloadStartedAt = performance.now();
     await preloadModelMotions(model);
     traceLog('model-load', 'startup-load-complete', {
       elapsedMs: Math.round(performance.now() - loadStartedAt),
+      criticalPreloadMs: Math.round(performance.now() - criticalPreloadStartedAt),
     });
 
     // Guard against textures with destroyed/missing source — the library
