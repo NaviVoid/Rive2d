@@ -1076,6 +1076,30 @@ function finiteNumber(value, fallback) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+async function preloadModelMotions(model) {
+  const manager = model.internalModel.motionManager;
+  const definitions = manager.definitions || {};
+  const tasks = [];
+
+  for (const [group, entries] of Object.entries(definitions)) {
+    if (!Array.isArray(entries)) continue;
+    for (let index = 0; index < entries.length; index += 1) {
+      tasks.push(manager.loadMotion(group, index));
+    }
+  }
+
+  const startedAt = performance.now();
+  const motions = await Promise.all(tasks);
+  const loaded = motions.filter(Boolean).length;
+  const failed = motions.length - loaded;
+  traceLog('motion', 'preload-complete', {
+    requested: motions.length,
+    loaded,
+    failed,
+    elapsedMs: Math.round(performance.now() - startedAt),
+  });
+}
+
 function normalizedControllerName(name) {
   const compact = name.toLowerCase().replaceAll('_', '');
   const names = {
@@ -2076,6 +2100,9 @@ function handleDragRelease(_event, reason = 'release') {
 // --- Model loading ---
 
 async function loadModel(modelPath) {
+  const loadStartedAt = performance.now();
+  traceLog('model-load', 'start', { modelPath });
+
   // Reset drag state so stale flags don't block taps on the new model
   dragging = false;
   dragMoved = false;
@@ -2137,10 +2164,28 @@ async function loadModel(modelPath) {
   try {
     // LPK assets are decrypted/extracted once before the webview starts
     // requesting textures, motions, physics and expressions.
+    const prepareStartedAt = performance.now();
     await resourcePreloader.prepare(modelPath);
+    traceLog('model-load', 'resources-ready', {
+      elapsedMs: Math.round(performance.now() - prepareStartedAt),
+    });
+
+    const modelStartedAt = performance.now();
     const model = await Live2DModel.from(modelPath, {
       autoHitTest: false,
       autoFocus: mouseTracking,
+      // The engine's default only preloads Idle and starts it in the
+      // background. We explicitly await every motion below so the first
+      // pointer event never competes with motion file parsing.
+      motionPreload: 'NONE',
+    });
+    traceLog('model-load', 'engine-model-ready', {
+      elapsedMs: Math.round(performance.now() - modelStartedAt),
+    });
+
+    await preloadModelMotions(model);
+    traceLog('model-load', 'startup-load-complete', {
+      elapsedMs: Math.round(performance.now() - loadStartedAt),
     });
 
     // Guard against textures with destroyed/missing source — the library
