@@ -568,8 +568,10 @@ model.unloaded
 
 ### 第 3 步：抽离 MotionSession 和 CommandRuntime
 
-- 统一文件动作和命令动作生命周期。
-- 接管 `Command`、`PostCommand`、锁和回滚。
+- [x] 新增 `Live2DCommandRuntime`，通过 `Live2DCommandHost` 隔离 Live2D、Pixi 和应用状态。
+- [x] `main.js` 的模型命令解析改为调用 TypeScript 命令运行时，保留现有命令语义和兼容播放器。
+- [ ] 统一文件动作和命令动作生命周期。
+- [ ] 接管 `Command`、`PostCommand`、锁和回滚。
 - 删除 `pendingNextMtn` 的全局单值设计，改为链实例字段。
 - 接入事件总线和结构化日志。
 

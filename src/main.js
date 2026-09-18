@@ -3,6 +3,7 @@ import { Assets } from 'pixi.js';
 import { Live2DModel, Live2DPlugin, SoundManager } from 'untitled-pixi-live2d-engine';
 import { AppRuntime } from './interaction/appRuntime';
 import { TauriResourcePreloader } from './interaction/assetPreloader';
+import { Live2DCommandRuntime } from './interaction/commandRuntime';
 import { ConsoleRuntimeLogger } from './interaction/logger';
 import { ModelRuntime } from './interaction/modelRuntime';
 
@@ -151,6 +152,101 @@ let extraMotionEnabled = false;
 let eyeBlinkSave = null;       // saved eyeBlink reference for enable/disable
 let physicsSave = null;        // saved physics reference for enable/disable
 let soundMuted = false;
+
+const live2DCommandRuntime = new Live2DCommandRuntime({
+  resolveNumber(rawValue) {
+    if (typeof rawValue !== 'string') return 0;
+    const value = rawValue.trim();
+    if (value.startsWith('$')) {
+      const stored = varStore[value.substring(1)];
+      return Number.isFinite(stored) ? stored : 0;
+    }
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  },
+  lockParameter(id, value, duration) {
+    if (!currentModel) return;
+    const cm = currentModel.internalModel.coreModel;
+    const index = getParameterIndexById(cm, id);
+    if (index < 0 || index >= cm.getParameterCount()) return;
+    lockedParams[id] = { paramIndex: index, value, startTime: performance.now(), duration };
+  },
+  unlockParameters(ids) {
+    for (const id of ids) delete lockedParams[id];
+  },
+  setParameter(id, value) {
+    if (!currentModel) return;
+    const cm = currentModel.internalModel.coreModel;
+    const index = getParameterIndexById(cm, id);
+    if (index >= 0 && index < cm.getParameterCount()) cm.setParameterValueByIndex(index, value);
+  },
+  startMotion(reference) {
+    if (!reference) return;
+    const resolved = resolveMotionRef(reference);
+    const [group, index] = resolved.split(':');
+    playMotion(group, index !== undefined ? parseInt(index) : undefined);
+  },
+  stopMotions() {
+    currentModel?.internalModel.motionManager.stopAllMotions();
+  },
+  setMouseTracking(enabled) {
+    mouseTracking = enabled;
+    if (!currentModel) return;
+    currentModel.automator.autoFocus = enabled;
+    if (!enabled) currentModel.internalModel.focusController.focus(0, 0);
+  },
+  setEyeBlink(enabled) {
+    if (!currentModel) return;
+    const internalModel = currentModel.internalModel;
+    if (!enabled) {
+      if (internalModel.eyeBlink && !eyeBlinkSave) {
+        eyeBlinkSave = internalModel.eyeBlink;
+        internalModel.eyeBlink = null;
+      }
+    } else if (eyeBlinkSave) {
+      internalModel.eyeBlink = eyeBlinkSave;
+      eyeBlinkSave = null;
+    }
+  },
+  setPhysics(enabled) {
+    if (!currentModel) return;
+    const internalModel = currentModel.internalModel;
+    if (!enabled) {
+      if (internalModel.physics && !physicsSave) {
+        physicsSave = internalModel.physics;
+        internalModel.physics = null;
+      }
+    } else if (physicsSave) {
+      internalModel.physics = physicsSave;
+      physicsSave = null;
+    }
+  },
+  setMotionGroupEnabled(group, enabled) {
+    if (enabled) disabledMotionGroups.delete(group);
+    else disabledMotionGroups.add(group);
+  },
+  setParamHitEnabled(id, enabled) {
+    if (enabled) disabledParamHitItems.delete(id);
+    else disabledParamHitItems.add(id);
+  },
+  setHitAreasEnabled(enabled) {
+    hitAreasEnabled = enabled;
+    drawHitAreas();
+  },
+  setPartOpacity(id, value, locked) {
+    if (!currentModel) return;
+    const cm = currentModel.internalModel.coreModel;
+    const index = cm.getPartIndex(id);
+    if (index < 0 || index >= cm.getPartCount()) return;
+    cm.setPartOpacityByIndex(index, value);
+    if (locked) lockedParts[id] = { index, value };
+    else delete lockedParts[id];
+  },
+  setSoundMuted(muted) {
+    soundMuted = muted;
+    SoundManager.volume = muted ? 0 : 1;
+  },
+}, interactionLogger);
 
 // Graphics overlays (drawn on top of model)
 const borderGfx = new PIXI.Graphics();
@@ -1758,166 +1854,7 @@ function applyIntimacyBonus(entry) {
 // --- Command system ---
 
 function executeCommand(cmdString) {
-  if (!cmdString) return;
-  const commands = cmdString.split(';');
-  for (const cmd of commands) {
-    const trimmed = cmd.trim();
-    if (trimmed) executeOneCommand(trimmed);
-  }
-}
-
-function resolveCommandNumber(rawValue) {
-  if (typeof rawValue !== 'string') {
-    return Number.isFinite(rawValue) ? rawValue : 0;
-  }
-  const value = rawValue.trim();
-  if (value.startsWith('$')) {
-    const stored = varStore[value.substring(1)];
-    return Number.isFinite(stored) ? stored : 0;
-  }
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function executeOneCommand(cmd) {
-  if (!currentModel) return;
-  const parts = cmd.split(/\s+/);
-  const verb = parts[0];
-  console.log(`[cmd] ${cmd}`);
-
-  switch (verb) {
-    case 'parameters': {
-      const action = parts[1];
-      const id = parts[2];
-      const cm = currentModel.internalModel.coreModel;
-      const paramCount = cm.getParameterCount();
-      if (action === 'lock' && id) {
-        const value = resolveCommandNumber(parts[3]);
-        const duration = parts[4] ? resolveCommandNumber(parts[4]) : 0;
-        const idx = getParameterIndexById(cm, id);
-        if (idx >= 0 && idx < paramCount) {
-          lockedParams[id] = { paramIndex: idx, value, startTime: performance.now(), duration };
-        }
-      } else if (action === 'unlock' && id) {
-        for (const pid of id.split(',')) delete lockedParams[pid.trim()];
-      } else if (action === 'set' && id) {
-        const value = resolveCommandNumber(parts[3]);
-        const idx = getParameterIndexById(cm, id);
-        if (idx >= 0 && idx < paramCount) cm.setParameterValueByIndex(idx, value);
-      }
-      break;
-    }
-    case 'start_mtn': {
-      const ref = parts.slice(1).join(' ').trim();
-      if (ref) {
-        const resolved = resolveMotionRef(ref);
-        const [g, idxStr] = resolved.split(':');
-        playMotion(g, idxStr !== undefined ? parseInt(idxStr) : undefined);
-      }
-      break;
-    }
-    case 'stop_mtn': {
-      currentModel.internalModel.motionManager.stopAllMotions();
-      break;
-    }
-    case 'mouse_tracking': {
-      const enable = parts[1] !== 'disable';
-      mouseTracking = enable;
-      currentModel.automator.autoFocus = enable;
-      if (!enable) currentModel.internalModel.focusController.focus(0, 0);
-      break;
-    }
-    case 'eye_blink': {
-      const enable = parts[1] !== 'disable';
-      const im = currentModel.internalModel;
-      if (!enable) {
-        if (im.eyeBlink && !eyeBlinkSave) {
-          eyeBlinkSave = im.eyeBlink;
-          im.eyeBlink = null;
-        }
-      } else if (eyeBlinkSave) {
-        im.eyeBlink = eyeBlinkSave;
-        eyeBlinkSave = null;
-      }
-      break;
-    }
-    case 'physics': {
-      const enable = parts[1] !== 'disable';
-      const im = currentModel.internalModel;
-      if (!enable) {
-        if (im.physics && !physicsSave) {
-          physicsSave = im.physics;
-          im.physics = null;
-        }
-      } else if (physicsSave) {
-        im.physics = physicsSave;
-        physicsSave = null;
-      }
-      break;
-    }
-    case 'motions': {
-      const action = parts[1];
-      const group = parts[2];
-      if (group) {
-        if (action === 'disable') disabledMotionGroups.add(group);
-        else if (action === 'enable') disabledMotionGroups.delete(group);
-      }
-      break;
-    }
-    case 'param_hit': {
-      const action = parts[1];
-      const ids = parts.slice(2).join(' ').split(',').map(s => s.trim());
-      for (const id of ids) {
-        if (action === 'disable') disabledParamHitItems.add(id);
-        else if (action === 'enable') disabledParamHitItems.delete(id);
-      }
-      break;
-    }
-    case 'hit_areas': {
-      if (parts[1] === 'disable') hitAreasEnabled = false;
-      else if (parts[1] === 'enable') hitAreasEnabled = true;
-      drawHitAreas();
-      break;
-    }
-    case 'parts': {
-      const action = parts[1];
-      const partId = parts[2];
-      const value = parseFloat(parts[3]);
-      if (!partId || isNaN(value)) break;
-      const cm = currentModel.internalModel.coreModel;
-      const partCount = cm.getPartCount();
-      const idx = cm.getPartIndex(partId);
-      if (idx < partCount) {
-        cm.setPartOpacityByIndex(idx, value);
-        if (action === 'lock') lockedParts[partId] = { index: idx, value };
-        else if (action === 'unlock') delete lockedParts[partId];
-      }
-      break;
-    }
-    case 'artmesh_opacities': {
-      console.log(`[cmd] artmesh_opacities deferred: ${parts.slice(1).join(' ')}`);
-      break;
-    }
-    case 'mute_sound': {
-      soundMuted = parts[1] === '1';
-      SoundManager.volume = soundMuted ? 0 : 1;
-      break;
-    }
-    case 'stop_sound': {
-      console.log(`[cmd] stop_sound: ${parts.slice(1).join(' ')}`);
-      break;
-    }
-    case 'open_url': {
-      console.log(`[cmd] open_url ignored (security): ${parts.slice(1).join(' ')}`);
-      break;
-    }
-    case 'replace_tex': {
-      console.log(`[cmd] replace_tex deferred: ${parts.slice(1).join(' ')}`);
-      break;
-    }
-    default:
-      console.log(`[cmd] unknown command: ${cmd}`);
-  }
+  live2DCommandRuntime.execute(cmdString);
 }
 
 // --- Speech bubble ---
