@@ -180,7 +180,7 @@ A variable-based state machine that gates which motions can play and modifies st
 | ------ | ------ | ---------------------------------------------------------------------------------------- |
 | `Name` | string | Variable name. `@`-prefixed names reference Live2D parameters directly                   |
 | `Type` | int    | `1` = condition (checked before motion plays), `2` = action (executed when motion plays) |
-| `Code` | string | Operation: `"equal N"`, `"not_equal N"`, or `"assign N"`                                 |
+| `Code` | string | Operation: `"equal N"`, `"not_equal N"`, `"assign N"`, `"add N"`, or `"init N"`                                 |
 
 **Condition evaluation**: All Type 1 entries must pass for the motion to be eligible. If any condition fails, the entry is skipped during random selection.
 

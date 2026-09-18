@@ -2,12 +2,29 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 /// Manifest file name inside LPK archives
 const MANIFEST_NAME: &str = "config.mlve";
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 const MAX_ENTRY_SIZE: u64 = 256 * 1024 * 1024;
 const MAX_TOTAL_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ArchiveFingerprint {
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+struct RenameMapCacheEntry {
+    fingerprint: ArchiveFingerprint,
+    map: HashMap<String, String>,
+}
+
+static RENAME_MAP_CACHE: OnceLock<Mutex<HashMap<String, RenameMapCacheEntry>>> = OnceLock::new();
+static DEBUG_CACHE_PATHS: OnceLock<Mutex<HashMap<String, (ArchiveFingerprint, PathBuf)>>> =
+    OnceLock::new();
 
 /// Return the virtual model entry used when an LPK is loaded without extraction.
 ///
@@ -29,6 +46,18 @@ pub fn direct_model_path(lpk_path: &str) -> Result<String, String> {
 /// No archive contents are written to disk.
 pub fn read_virtual_asset(path: &str) -> Result<Vec<u8>, String> {
     let (lpk_path, entry) = split_virtual_path(path).ok_or("Not an LPK virtual path")?;
+
+    // Debug builds keep a disk-backed extraction cache so repeated webview
+    // requests do not reopen and decrypt the workshop archive every time.
+    if cfg!(debug_assertions) {
+        if let Ok(cache_dir) = ensure_debug_cache(lpk_path) {
+            let cached = cache_entry_path(&cache_dir, entry)?;
+            if cached.is_file() {
+                return std::fs::read(cached).map_err(|e| e.to_string());
+            }
+        }
+    }
+
     if let Some(preview) = workshop_preview_file(lpk_path) {
         let preview_name = format!(
             "__workshop_preview__.{}",
@@ -51,6 +80,190 @@ pub fn read_virtual_asset(path: &str) -> Result<Vec<u8>, String> {
         None => read_archive_entry(&mut archive, entry)?,
     };
     Ok(data)
+}
+
+fn debug_cache_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(path).join("rive2d/lpk");
+    }
+    if let Some(path) = std::env::var_os("HOME") {
+        return PathBuf::from(path).join(".cache/rive2d/lpk");
+    }
+    std::env::temp_dir().join("rive2d-lpk-cache")
+}
+
+fn cache_entry_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let relative = Path::new(relative);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!("Unsafe cached asset path: {}", relative.display()));
+    }
+    let path = root.join(relative);
+    if !path.starts_with(root) {
+        return Err(format!(
+            "Cached asset escapes destination: {}",
+            relative.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn write_cached_asset(root: &Path, relative: &str, data: &[u8]) -> Result<(), String> {
+    let path = cache_entry_path(root, relative)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(path, data).map_err(|e| e.to_string())
+}
+
+fn marker_path(root: &Path) -> PathBuf {
+    root.join(".complete")
+}
+
+fn ensure_debug_cache(lpk_path: &str) -> Result<PathBuf, String> {
+    let fingerprint = archive_fingerprint(lpk_path)?;
+    let cache_paths = DEBUG_CACHE_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache_paths.lock() {
+        if let Some((cached_fingerprint, destination)) = cache.get(lpk_path) {
+            if *cached_fingerprint == fingerprint && marker_path(destination).is_file() {
+                return Ok(destination.clone());
+            }
+        }
+    }
+
+    // The source is hashed only once per archive version. The hash keeps
+    // stale extractions from being reused after a Workshop file changes.
+    let source = std::fs::read(lpk_path).map_err(|e| e.to_string())?;
+    let key = format!("{:x}", md5::compute(&source));
+    let root = debug_cache_root();
+    let destination = root.join(&key);
+    if marker_path(&destination).is_file() {
+        return Ok(destination);
+    }
+
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let temporary = root.join(format!(".{}.tmp-{}", key, std::process::id()));
+    if temporary.exists() {
+        std::fs::remove_dir_all(&temporary).map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(&temporary).map_err(|e| e.to_string())?;
+
+    let result = (|| {
+        let mut archive = open_archive(lpk_path)?;
+        let manifest = read_manifest(&mut archive);
+        match manifest {
+            Some(ref manifest) => {
+                extract_encrypted_archive(lpk_path, &mut archive, manifest, &temporary)?
+            }
+            None => extract_regular_archive(&mut archive, &temporary)?,
+        }
+        if let Some(preview) = workshop_preview_file(lpk_path) {
+            let extension = preview
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("png")
+                .to_string();
+            let data = std::fs::read(&preview).map_err(|e| e.to_string())?;
+            write_cached_asset(
+                &temporary,
+                &format!("__workshop_preview__.{}", extension),
+                &data,
+            )?;
+        }
+        std::fs::write(marker_path(&temporary), b"rive2d-debug-cache-v1")
+            .map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    })();
+
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+
+    if destination.exists() {
+        let _ = std::fs::remove_dir_all(&temporary);
+    } else if let Err(error) = std::fs::rename(&temporary, &destination) {
+        let _ = std::fs::remove_dir_all(&temporary);
+        if !marker_path(&destination).is_file() {
+            return Err(error.to_string());
+        }
+    }
+    if let Ok(mut cache) = cache_paths.lock() {
+        cache.insert(lpk_path.to_string(), (fingerprint, destination.clone()));
+    }
+    Ok(destination)
+}
+
+fn extract_regular_archive(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    destination: &Path,
+) -> Result<(), String> {
+    let names: Vec<String> = (0..archive.len())
+        .filter_map(|index| {
+            archive
+                .by_index(index)
+                .ok()
+                .map(|file| file.name().to_string())
+        })
+        .collect();
+    for name in names {
+        if name.ends_with('/') {
+            continue;
+        }
+        let data = read_archive_entry(archive, &name)?;
+        write_cached_asset(destination, &name, &data)?;
+    }
+    Ok(())
+}
+
+fn extract_encrypted_archive(
+    lpk_path: &str,
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    manifest: &MlveManifest,
+    destination: &Path,
+) -> Result<(), String> {
+    let rename_map = cached_encrypted_rename_map(lpk_path, archive, manifest)?;
+    let manifest_hash = format!("{:x}", md5::compute(MANIFEST_NAME.as_bytes()));
+    let names: Vec<String> = (0..archive.len())
+        .filter_map(|index| {
+            archive
+                .by_index(index)
+                .ok()
+                .map(|file| file.name().to_string())
+        })
+        .collect();
+
+    for name in names {
+        if name.ends_with('/')
+            || name == MANIFEST_NAME
+            || name == manifest_hash
+            || name == format!("{}.bin", manifest_hash)
+        {
+            continue;
+        }
+        let output_name = rename_map.get(&name).map(String::as_str).unwrap_or(&name);
+        let data = read_encrypted_entry(lpk_path, archive, manifest, &name)?;
+        write_cached_asset(destination, output_name, &data)?;
+    }
+
+    // Expose the encrypted costume descriptor through its generated model
+    // filename, with hashed references rewritten to extracted names.
+    let (model_name, costume_entry) = encrypted_model_info(lpk_path, archive, manifest)?;
+    let mut model = String::from_utf8(read_encrypted_entry(
+        lpk_path,
+        archive,
+        manifest,
+        &costume_entry,
+    )?)
+    .map_err(|e| e.to_string())?;
+    for (old_name, new_name) in rename_map {
+        model = model.replace(&old_name, &new_name);
+    }
+    write_cached_asset(destination, &model_name, model.as_bytes())?;
+    Ok(())
 }
 
 /// Return the Workshop cover as another virtual asset when the LPK has one.
@@ -188,7 +401,7 @@ fn encrypted_model_info(
     archive: &mut zip::ZipArchive<std::fs::File>,
     manifest: &MlveManifest,
 ) -> Result<(String, String), String> {
-    let rename_map = encrypted_rename_map(lpk_path, archive, manifest)?;
+    let rename_map = cached_encrypted_rename_map(lpk_path, archive, manifest)?;
     for character in &manifest.list {
         for costume in &character.costume {
             if !rename_map.contains_key(&costume.path) {
@@ -272,6 +485,42 @@ fn encrypted_rename_map(
     Ok(rename_map)
 }
 
+fn cached_encrypted_rename_map(
+    lpk_path: &str,
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    manifest: &MlveManifest,
+) -> Result<HashMap<String, String>, String> {
+    let fingerprint = archive_fingerprint(lpk_path)?;
+    let cache = RENAME_MAP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock() {
+        if let Some(entry) = cache.get(lpk_path) {
+            if entry.fingerprint == fingerprint {
+                return Ok(entry.map.clone());
+            }
+        }
+    }
+
+    let map = encrypted_rename_map(lpk_path, archive, manifest)?;
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(
+            lpk_path.to_string(),
+            RenameMapCacheEntry {
+                fingerprint,
+                map: map.clone(),
+            },
+        );
+    }
+    Ok(map)
+}
+
+fn archive_fingerprint(lpk_path: &str) -> Result<ArchiveFingerprint, String> {
+    let metadata = std::fs::metadata(lpk_path).map_err(|e| e.to_string())?;
+    Ok(ArchiveFingerprint {
+        length: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
 fn read_encrypted_entry(
     lpk_path: &str,
     archive: &mut zip::ZipArchive<std::fs::File>,
@@ -322,14 +571,14 @@ fn read_encrypted_virtual_asset(
             &costume_entry,
         )?)
         .map_err(|e| e.to_string())?;
-        let rename_map = encrypted_rename_map(lpk_path, archive, manifest)?;
+        let rename_map = cached_encrypted_rename_map(lpk_path, archive, manifest)?;
         for (old_name, new_name) in rename_map {
             content = content.replace(&old_name, &new_name);
         }
         return Ok(content.into_bytes());
     }
 
-    let rename_map = encrypted_rename_map(lpk_path, archive, manifest)?;
+    let rename_map = cached_encrypted_rename_map(lpk_path, archive, manifest)?;
     if let Some((archive_entry, _)) = rename_map
         .iter()
         .find(|(_, output_name)| output_name.as_str() == requested_entry)
@@ -654,6 +903,12 @@ mod tests {
         if let Some(texture) = texture {
             let texture_path = join_virtual_path(&model_path, texture).unwrap();
             assert!(!read_virtual_asset(&texture_path).unwrap().is_empty());
+        }
+
+        if cfg!(debug_assertions) {
+            let cache = ensure_debug_cache(&path).unwrap();
+            assert!(marker_path(&cache).is_file());
+            assert!(cache.join(".complete").is_file());
         }
     }
 }
