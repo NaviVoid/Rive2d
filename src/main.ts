@@ -139,8 +139,6 @@ let intimacyConfig = null;     // { initValue, minValue, maxValue }
 let currentMotionInfo = null;  // { group, index, entry }
 let playedMotions = new Set(); // for PreMtn tracking
 let deferredMotionStateActions = new Map(); // { `${group}:${index}`: { actions, lockState } }
-let completedStateTransitions = new Set();
-let activeStateCompletion = null; // { ref, lockIds: string[] }
 let leaveGroups = [];          // { group, interval, minDuration, maxDuration }
 let lastInteractionTime = 0;
 let leaveTimeout = null;
@@ -541,8 +539,6 @@ listen('unload-model', async () => {
     currentMotionInfo = null;
     playedMotions = new Set();
     deferredMotionStateActions = new Map();
-    completedStateTransitions = new Set();
-    activeStateCompletion = null;
     leaveGroups = [];
     if (leaveTimeout) { clearInterval(leaveTimeout); leaveTimeout = null; }
     leaveActive = false;
@@ -1790,25 +1786,6 @@ function applyDeferredStateActions(actions) {
   }
 }
 
-function getStateTransitionActions(entry) {
-  const actions = getDeferredStateActions(entry);
-  const conditions = (entry?.VarFloats || [])
-    .filter(vf => vf.Type === 1 && vf.Name)
-    .map(vf => {
-      const parts = (vf.Code || '').trim().split(/\s+/);
-      return { name: vf.Name, op: parts[0]?.toLowerCase(), value: parseFloat(parts[1]) };
-    });
-  return actions.filter(action => {
-    const target = parseFloat((action.Code || '').trim().split(/\s+/)[1]);
-    return conditions.some(condition => (
-      condition.name === action.Name
-      && Number.isFinite(condition.value)
-      && condition.value === target
-      && (condition.op === 'equal' || condition.op === 'not_equal')
-    ));
-  });
-}
-
 function getStateValue(name) {
   if (currentModel) {
     const cm = currentModel.internalModel.coreModel;
@@ -1816,111 +1793,6 @@ function getStateValue(name) {
     if (index >= 0 && index < cm.getParameterCount()) return cm.getParameterValueByIndex(index);
   }
   return varStore[name] ?? 0;
-}
-
-function findStateCompletionMotion() {
-  let best = null;
-  for (const [group, entries] of Object.entries(modelMotions)) {
-    for (let index = 0; index < entries.length; index++) {
-      const entry = entries[index];
-      const name = String(entry?.Name || '').toLowerCase();
-      if (!name || (!/(?:mission[_ ]?complete|complete|success|finished|finish|done|clear)/i.test(name))) {
-        continue;
-      }
-      let score = 0;
-      if (name === 'mission_complete') score += 1000;
-      else if (name.startsWith('mission_complete_')) score += 900;
-      else if (name === 'complete') score += 800;
-      else if (name.startsWith('complete_')) score += 700;
-      if (/select|result|complete|finish|success/i.test(group)) score += 100;
-      if (entry.Language) score -= 10;
-      if (!best || score > best.score) best = { group, index, score, name: entry.Name };
-    }
-  }
-  return best ? `${best.group}:${best.index}` : null;
-}
-
-function maybeTriggerStateCompletion(group) {
-  const entries = modelMotions[group];
-  if (!Array.isArray(entries)) return null;
-
-  const states = new Map();
-  for (const entry of entries) {
-    for (const action of getStateTransitionActions(entry)) {
-      const parts = (action.Code || '').trim().split(/\s+/);
-      const target = parseFloat(parts[1]);
-      if (Number.isFinite(target)) states.set(`${action.Name}:${target}`, { name: action.Name, target });
-    }
-  }
-  if (states.size < 2) return null;
-
-  const stateList = [...states.values()];
-  const complete = stateList.every(state => Math.abs(getStateValue(state.name) - state.target) < 0.0001);
-  const signaturePrefix = `${group}:`;
-  if (!complete) {
-    for (const signature of completedStateTransitions) {
-      if (signature.startsWith(signaturePrefix)) completedStateTransitions.delete(signature);
-    }
-    return null;
-  }
-
-  const signature = `${group}:${stateList.map(state => `${state.name}=${state.target}`).sort().join(',')}`;
-  if (completedStateTransitions.has(signature)) return null;
-  const ref = findStateCompletionMotion();
-  if (!ref) return null;
-  completedStateTransitions.add(signature);
-  activeStateCompletion = {
-    ref: resolveMotionRef(ref),
-    lockIds: [...getStateParameterLockIds(entries)],
-  };
-  traceLog('motion', 'state-complete', {
-    group,
-    states: stateList,
-    motion: ref,
-    releaseLocksAfter: activeStateCompletion.lockIds,
-  });
-  return ref;
-}
-
-function getStateParameterLockIds(entries) {
-  const ids = new Set();
-  for (const entry of entries || []) {
-    const actions = (entry?.VarFloats || []).filter((vf) => (
-      vf.Type === 2
-      && vf.Name
-      && !vf.Name.startsWith('@')
-      && /^assign\s+/i.test(vf.Code || '')
-    ));
-    const lockCommands = (entry?.Command || '')
-      .split(';')
-      .map((command) => command.trim().split(/\s+/))
-      .filter((parts) => (
-        parts[0] === 'parameters'
-        && parts[1] === 'lock'
-        && parts[2]
-        && parts[3]
-      ));
-    for (const action of actions) {
-      const lockCommand = lockCommands.find((parts) => (
-        parts[2].split(',').includes(action.Name)
-        && parts[3] === `$${action.Name}`
-      ));
-      if (lockCommand) ids.add(action.Name);
-    }
-  }
-  return ids;
-}
-
-function releaseCompletedStateLocks(finishedRef) {
-  if (!activeStateCompletion || activeStateCompletion.ref !== finishedRef) return;
-  for (const id of activeStateCompletion.lockIds) {
-    if (lockedParams[id]) delete lockedParams[id];
-  }
-  traceLog('motion', 'state-complete-locks-released', {
-    motion: finishedRef,
-    parameters: activeStateCompletion.lockIds,
-  });
-  activeStateCompletion = null;
 }
 
 function persistStateParameterLocks(entry, commandString = entry?.PostCommand) {
@@ -2244,8 +2116,6 @@ async function loadModel(modelPath) {
   currentMotionInfo = null;
   playedMotions = new Set();
   deferredMotionStateActions = new Map();
-  completedStateTransitions = new Set();
-  activeStateCompletion = null;
   leaveGroups = [];
   if (leaveTimeout) { clearInterval(leaveTimeout); leaveTimeout = null; }
   leaveActive = false;
@@ -2879,25 +2749,15 @@ async function loadModel(modelPath) {
       if (currentMotionInfo?.entry?.PostCommand) {
         executeCommand(currentMotionInfo.entry.PostCommand);
       }
-      const stateCompletion = currentMotionInfo?.group
-        ? maybeTriggerStateCompletion(currentMotionInfo.group)
-        : null;
-      const finishedRef = currentMotionInfo?.group && currentMotionInfo?.index !== undefined
-        ? `${currentMotionInfo.group}:${currentMotionInfo.index}`
-        : null;
       const nextMtn = pendingNextMtn;
       pendingNextMtn = null;
       currentMotionInfo = null;
 
-      // State-action locks are held through the completion motion so the
-      // grabbed parts remain stable during the full interaction. Once that
-      // motion finishes, release the locks and let the selected Idle motion
-      // restore its own parameter curves.
-      releaseCompletedStateLocks(finishedRef);
-
       // Wait for the motion audio and manager reservation to settle before
       // starting NextMtn/Idle. TouchSpecial includes a sound in this model.
-      scheduleMotionTransition(model, stateCompletion || nextMtn);
+      // Completion and reset are only valid when explicitly declared by the
+      // model through PostCommand or NextMtn; action names are not semantics.
+      scheduleMotionTransition(model, nextMtn);
     });
 
     model.on('pointertap', (e) => {

@@ -1,254 +1,235 @@
-# Live2DViewerEX model3.json Format Reference
+# Live2DViewerEX JSON Parsing Reference
 
-This documents the `.model3.json` format used by [Live2DViewerEX](https://store.steampowered.com/app/616720/Live2DViewerEX/) models. Rive2d parses this format to load and interact with Live2D models.
+This document describes the Live2DViewerEX JSON data that Rive2d needs to
+parse for model loading and interaction. The behavioral definitions in this
+document follow the official Live2DViewerEX JSON Editor documentation:
 
-## Top-Level Structure
+- Local reference: `docs/reference/live2d-editor/live2d-editor.html`
+- Online reference: <https://live2d.pavostudio.com/doc/en-us/exstudio/live2d-editor/>
+
+The editor documentation defines the meaning of an item. It does not promise
+one stable serialization spelling for every model version. Rive2d therefore
+normalizes the known spelling variants first, then evaluates the normalized
+data using the rules below. A field observed in an imported model but not
+defined by the official documentation must be treated as a compatibility
+extension, not as a new official semantic.
+
+## Parsing Principles
+
+1. Preserve the original group, item, motion, and variable names.
+2. Normalize case and legacy aliases only at the adapter boundary.
+3. Resolve motion references only after all motion groups and names are indexed.
+4. Do not infer behavior from names such as `drag`, `special`, or
+   `mission_complete`.
+5. Missing optional fields retain the viewer/runtime default; they do not
+   acquire meaning from a nearby field.
+6. Keep unknown fields available for diagnostics and future compatibility.
+
+## Model Configuration
+
+Most imported models use a Cubism 3-style configuration with a shape similar
+to this:
 
 ```jsonc
 {
   "Version": 3,
-  "Type": 0,                    // optional, always 0
-  "FileReferences": { ... },    // paths to model assets + motions
-  "HitAreas": [ ... ],          // interactive regions
-  "Controllers": { ... },       // behavior controllers
-  "Options": { ... },           // display/rendering options
-  "Groups": [ ... ],            // Cubism SDK parameter groups (standard format)
-  "Bounds": {                   // optional, model canvas bounds
-    "Width": 30.28,
-    "Height": 23.72,
-    "CenterX": 0.0,
-    "CenterY": 0.0
+  "FileReferences": {
+    "Moc": "model.moc3",
+    "Textures": ["texture_00.png"],
+    "Motions": {
+      "Idle": [{ "File": "idle.motion3.json", "FileLoop": true }]
+    },
+    "Physics": "physics.json",
+    "Expressions": [{ "Name": "smile", "File": "smile.exp3.json" }],
+    "Pose": "pose.json"
   },
-  "Bubble": null                // placeholder for speech bubble config
+  "HitAreas": [],
+  "Controllers": {},
+  "Options": {},
+  "Groups": []
 }
 ```
 
-### Legacy Top-Level Fields
+`FileReferences`, `HitAreas`, `Controllers`, and `Options` are the important
+sections for Rive2d interaction. `Moc`, texture order, and referenced files
+are still required for rendering.
 
-Older models may have these at the top level instead of inside `Controllers`/`Options`:
+### Legacy aliases
 
-| Field                | Moved To                          |
-| -------------------- | --------------------------------- |
-| `HitParams`          | `Controllers.ParamHit.Items`      |
-| `LoopParams`         | `Controllers.ParamLoop.Items`     |
-| `IntimacyParam`      | `Controllers.IntimacySystem`      |
-| `LipSync` (bool)     | `Controllers.LipSync.Enabled`     |
-| `EyeBlink` (bool)    | `Controllers.EyeBlink.Enabled`    |
-| `ExtraMotion` (bool) | `Controllers.ExtraMotion.Enabled` |
-| `ScaleFactor`        | `Options.ScaleFactor`             |
-| `TexFixed`           | `Options.TexFixed`                |
-| `LipScale`           | `Controllers.LipSync.Gain`        |
-| `AnisoLevel`         | `Options.AnisoLevel`              |
+Older or variant configurations may put equivalent values at the top level or
+use lower-case names. The parser may normalize these aliases:
 
----
+| Legacy spelling | Normalized section |
+| --- | --- |
+| `HitParams` | `Controllers.ParamHit.Items` |
+| `LoopParams` | `Controllers.ParamLoop.Items` |
+| `LipSync` | `Controllers.LipSync.Enabled` or the corresponding controller object |
+| `EyeBlink` | `Controllers.EyeBlink.Enabled` or the corresponding controller object |
+| `ExtraMotion` | `Controllers.ExtraMotion.Enabled` or the corresponding controller object |
+| `ScaleFactor`, `TexFixed`, `AnisoLevel` | `Options` |
+| `motions`, `hit_areas`, `controllers` | `Motions`, `HitAreas`, `Controllers` |
 
-## FileReferences
+These are parser compatibility mappings. They do not change the official
+meaning of the normalized item.
 
-```jsonc
-{
-  "Moc": "model.moc3",                       // compiled model binary
-  "Textures": ["texture_00.png"],             // texture images (1-6 per model)
-  "Motions": { ... },                         // motion groups (see below)
-  "Physics": "physics.json",                  // physics settings
-  "PhysicsV2": {                              // optional enhanced physics
-    "File": "physics.json",
-    "MaxWeight": 0.999                        // max physics weight (0-1)
-  },
-  "Expressions": [                            // optional facial expression presets
-    { "Name": "blush", "File": "exp_blush.json" }
-  ],
-  "Pose": "pose.json"                         // optional pose definition
-}
-```
+## Frame Execution Order
 
----
+The official execution order is:
 
-## Motions
+1. Restore saved parameter values and part transparency from the previous
+   frame.
+2. Play motion files in hierarchical/layer order.
+3. Execute controllers.
+4. Execute instruction code.
+5. Save parameter values and part transparency for the next frame.
+6. Execute physics.
 
-`FileReferences.Motions` is a dictionary mapping **group names** to **arrays of motion entries**.
+The order is significant. A drag controller is evaluated after motions and
+before physics. A later layer, controller, instruction, or physics step may
+therefore affect the value produced by an earlier step.
 
-```jsonc
-{
-  "Idle": [{ "File": "idle.motion3.json", "FileLoop": true }],
-  "Start": [{ "File": "start.motion3.json", "Name": "login" }],
-  "Tap身体": [{ "File": "tap_body.motion3.json", "Sound": "voice.wav" }],
-}
-```
+## Hit Areas
 
-### Motion Group Naming Conventions
+Hit areas are model trigger areas that can activate motion events through mouse
+interaction. The official editor properties are:
 
-| Pattern                     | Purpose                                             |
-| --------------------------- | --------------------------------------------------- |
-| `Idle`, `Idle#1`, `Idle#2`  | Idle animations (loop). `#N` suffix = layer/variant |
-| `Start`                     | Startup animation on model load                     |
-| `Tap`, `Tap身体`, `Tap摸头` | Tap interaction motions                             |
-| `TouchDrag1`, `drag1`       | Drag interaction motions                            |
-| `TouchIdle1`                | Idle touch state animations                         |
-| `Leave60_40_60`             | Timed idle: triggers after 60s idle, lasts 40-60s   |
+| Property | Meaning |
+| --- | --- |
+| `Name` | Area name. |
+| `ID` / `Id` | Cubism ArtMesh ID associated with the area. |
+| `Sorting` / `Order` | Overlap order. The higher order receives the event. |
+| `Clickable When Invisible` | Allows a fully transparent ArtMesh to receive clicks. |
+| `Click Action` | Action executed when the area is clicked. |
+| `Press Action` | Action executed when the pointer is pressed in the area. |
+| `Release Action` | Action executed when the pointer is released, including outside the area. |
+| `Enter Action` | Action executed when the pointer enters the area. |
+| `Exit Action` | Action executed when the pointer leaves the area. |
+| `Enabled` | Whether the area can receive events. |
 
-The `#N` suffix indicates a **layer variant** that can play simultaneously with the base group. `Idle#1` plays on top of `Idle`.
+Many model files serialize the click action as `Motion`, while other files or
+versions use action-specific fields. Rive2d must normalize those fields into
+separate click, press, release, enter, and exit routes instead of treating a
+single `Motion` value as every event type.
 
-### Motion Entry Fields
+An ArtMesh normally needs visible content to receive an event. The
+`Clickable When Invisible` option is the explicit exception. An absent or
+disabled route is a no-op; it must not cause a motion to be guessed from the
+area name.
 
-Each entry in a motion group array can have these fields:
+### Motion references
 
-#### Core Fields
+The reference syntax is:
 
-| Field      | Type   | Description                                                                                            |
-| ---------- | ------ | ------------------------------------------------------------------------------------------------------ |
-| `File`     | string | Path to `.motion3.json` file. **Optional** — entries without `File` are command-only or menu entries   |
-| `Name`     | string | Identifier within the group. Used by `NextMtn` references (`"Group:Name"`)                             |
-| `Priority` | int    | Playback priority. Higher overrides lower. Common values: 2 (idle), 3 (normal), 4 (force), 9 (highest) |
-| `Weight`   | int    | Random selection weight within the group. Higher = more likely to be picked. Default: 1                |
-| `Enabled`  | bool   | Set to `false` to disable without removing                                                             |
+- `Group`: choose an eligible motion from the group, normally using the
+  configured weights and conditions.
+- `Group:MotionName`: choose the named motion in the group.
 
-#### Animation Control
+This syntax is used by hit-area actions, `NextMtn`, `PreMtn`, `Choices`, and
+the `start_mtn` command. Names are case-sensitive after normalization unless a
+specific legacy adapter says otherwise.
 
-| Field            | Type      | Description                                                 |
-| ---------------- | --------- | ----------------------------------------------------------- |
-| `FileLoop`       | bool      | Loop the motion file continuously                           |
-| `WrapMode`       | int       | `1` = loop (equivalent to `FileLoop: true`)                 |
-| `FadeIn`         | int       | Fade-in duration in milliseconds                            |
-| `FadeOut`        | int       | Fade-out duration in milliseconds                           |
-| `Speed`          | float     | Playback speed multiplier (e.g., `0.5` = half speed)        |
-| `MotionDuration` | int       | Motion duration in milliseconds                             |
-| `Duration`       | int       | Override duration in ms (used in timed groups like `Leave`) |
-| `Interruptable`  | bool      | Whether another motion can interrupt this one               |
-| `Ignorable`      | bool      | Whether this motion can be skipped                          |
-| `TimeLimit`      | int\|null | Time limit in ms (placeholder, usually null)                |
+## Motion Groups and Motion Entries
 
-#### Sound
+`FileReferences.Motions` is a dictionary from group name to an array of motion
+events. A motion event may contain a motion file, commands, conditions, text,
+choices, or a combination of these.
 
-| Field          | Type   | Description                      |
-| -------------- | ------ | -------------------------------- |
-| `Sound`        | string | Path to `.wav`/`.mp3` sound file |
-| `SoundDelay`   | int    | Delay before playing sound (ms)  |
-| `SoundVolume`  | float  | Volume (0.0 - 1.0)               |
-| `SoundChannel` | int    | Audio channel (1 or 2)           |
-| `SoundLoop`    | bool   | Loop the sound                   |
+### Groups and layers
 
-#### Text / Dialogue
+The predefined groups include `Idle`, `Start`, `Tap`, area-specific tap groups,
+`Shake`, `Tick`, `TickX`, and `LeaveX_Y_Z`. SDK 3 uses capitalized names; older
+SDK 2 configurations may use lower-case variants.
 
-| Field          | Type   | Description                                             |
-| -------------- | ------ | ------------------------------------------------------- |
-| `Text`         | string | Dialogue text displayed in speech bubble                |
-| `TextDelay`    | int    | Delay before showing text (ms)                          |
-| `TextDuration` | int    | How long text is displayed (ms)                         |
-| `Language`     | string | Language code for multi-language support (e.g., `"en"`) |
+Custom groups can use `Group#Layer` to select a motion layer. Layer 0 is named
+`Group`, not `Group#0`. `Idle#1` and other layered idle groups can run together
+with lower layers. Predefined groups other than `Idle` do not gain layering
+just by adding `#N`; use `start_mtn` inside a motion when a layered start is
+required.
 
-#### Chaining
+### Motion execution and completion
 
-| Field         | Type         | Description                                                                       |
-| ------------- | ------------ | --------------------------------------------------------------------------------- |
-| `NextMtn`     | string       | Motion to play after this one finishes. Format: `"Group"` or `"Group:Name"`       |
-| `PreMtn`      | string\|null | Prerequisite motion that must have played first. Format: `"Group:Name"`           |
-| `Command`     | string       | Command(s) executed when motion starts. See [Command Language](#command-language) |
-| `PostCommand` | string       | Command(s) executed after motion finishes                                         |
+By default, the program loops the `Idle` motion and hierarchical motions run
+synchronously. When a motion reaches the end:
 
-#### Choices (Interactive Menus)
+- `NextMtn` is the explicit next motion.
+- `PostCommand` runs after the motion finishes and before the next motion is
+  resolved.
+- A looping motion cannot trigger end-of-motion events such as `PostCommand`
+  or `NextMtn`.
+- If the layer has an `Idle` motion and no explicit next motion interrupts it,
+  the layer returns to that idle motion.
+- If the layer has no `Idle` motion, it stops at the last frame.
 
-```jsonc
-{
-  "Choices": [
-    { "Text": "Enable mouse tracking", "NextMtn": "开启鼠标追踪" },
-    { "Text": "View details", "NextMtn": "查看详情" },
-    { "Text": "Exit menu" }, // no NextMtn = closes menu
-  ],
-}
-```
+Rive2d must not infer a reset, completion state, menu action, or idle target
+from a motion name. A model returns to its initial idle only when the JSON
+explicitly selects that idle, or when the documented layer-idle fallback
+applies to the layer containing the motion.
 
-| Field               | Type   | Description                                              |
-| ------------------- | ------ | -------------------------------------------------------- |
-| `Choices`           | array  | Interactive choice menu displayed to the user            |
-| `Choices[].Text`    | string | Display text for the option                              |
-| `Choices[].NextMtn` | string | Motion group to play when selected. Absent = exit/cancel |
+### Motion event properties
 
-#### VarFloats (Conditions & Actions)
+| Property | Official meaning |
+| --- | --- |
+| `Name` | Name used to identify this event in a full motion reference. Without it, only the group can identify the event. |
+| `Language` | Event is eligible only when the application language matches. |
+| `File` | `motion3.json` file to play. It may be absent for command/menu entries. |
+| `FileLoop` / end setting | Whether the motion continues from the beginning. Looping disables end events. |
+| `Text`, `TextDuration`, `TextDelay` | Text and its display timing. |
+| `Expression` | Expression played during the motion. |
+| `Sound`, `SoundChannel`, `SoundVolume`, `SoundDelay`, `SoundLoop` | Sound playback settings. |
+| `BlendMode`, `BlendWeight` | Motion blending with other layers. |
+| `FadeIn`, `FadeInLoop`, `FadeOut` | Motion transition timing. |
+| `Priority` | Priority 2-9; higher priorities interrupt lower ones, and 9 forcibly overrides the previous event. |
+| `MotionDuration` | Custom event duration independent of motion or sound duration. |
+| `Weight` | Random-selection weight, range 1-999; default 1. |
+| `Speed` | Playback speed; unavailable in SDK 2. |
+| `Pre-Command` | Command executed before the motion starts. Serialized variants include `Command` or `PreCommand`. |
+| `PostCommand` | Command executed after the motion finishes. |
+| `Previous Motion` / `PreMtn` | Current event is eligible only after the specified previous event. |
+| `Next Motion` / `NextMtn` | Event selected after this event finishes. |
+| `Override Facial Tracking Parameters` | Prevents facial tracking from affecting this motion. |
+| `Enabled` | Whether the event can execute. |
+| `Interruptible` | Same-priority events may interrupt this event when enabled; ineffective at priority 9. |
+| `Ignorable` | Event may be skipped when another eligible event has a time limit. A time limit makes this option ineffective. |
+| `TimeLimit` | Time condition restricting execution. |
+| `Intimacy` | Minimum, maximum, equal, and reward rules for intimacy. |
+| `Choices` | Selectable options displayed in the text box; each option can contain `Text` and `NextMtn`. |
 
-A variable-based state machine that gates which motions can play and modifies state.
+## VarFloats
 
-```jsonc
-{
-  "VarFloats": [
-    { "Name": "var_voice", "Type": 1, "Code": "equal 1" }, // condition: only if var_voice == 1
-    { "Name": "id", "Type": 2, "Code": "assign 3" }, // action: set id = 3
-  ],
-}
-```
+Floating-point variables provide official condition checks and value
+operations for motion events. The serialized representation varies between
+model versions, so the parser must preserve the variable name and parse its
+operation tokens rather than relying on numeric type codes.
 
-| Field  | Type   | Description                                                                              |
-| ------ | ------ | ---------------------------------------------------------------------------------------- |
-| `Name` | string | Variable name. `@`-prefixed names reference Live2D parameters directly                   |
-| `Type` | int    | `1` = condition (checked before motion plays), `2` = action (executed when motion plays) |
-| `Code` | string | Operation: `"equal N"`, `"not_equal N"`, `"assign N"`, `"add N"`, or `"init N"`                                 |
+### Conditions
 
-**Condition evaluation**: All Type 1 entries must pass for the motion to be eligible. If any condition fails, the entry is skipped during random selection.
+Supported condition operators are `greater`, `greater_equal`, `lower`,
+`lower_equal`, `equal`, and `not_equal`.
 
-**Common variables**:
+### Value operations
 
-| Variable      | Purpose                                |
-| ------------- | -------------------------------------- |
-| `var_voice`   | Idle voice toggle (0=off, 1=on)        |
-| `var_start`   | Login animation toggle (0=on, 1=off)   |
-| `Tmo`         | Timer/timeout state flag               |
-| `id`          | Motion variant selector for cycling    |
-| `@param_name` | Direct reference to a Live2D parameter |
+Supported operations are `assign`, `add`, `subtract`, `multiply`, `divide`,
+`init`, and `round`. `round` specifies the number of decimal places to keep.
+`init` only takes effect when the variable has not been saved already.
 
-#### Intimacy
+Variables can be saved. A variable reference begins with `$`; a model
+parameter reference begins with `@`, for example `@ParamAngleX`. The official
+runtime also supports `rand(min, max)` and `randf(min, max)`.
 
-```jsonc
-{
-  "Intimacy": { "Min": 50, "Max": 100, "Bonus": 5 },
-}
-```
-
-| Field   | Type | Description                                   |
-| ------- | ---- | --------------------------------------------- |
-| `Min`   | int  | Minimum intimacy required to play             |
-| `Max`   | int  | Maximum intimacy allowed to play              |
-| `Equal` | int  | Exact intimacy value required                 |
-| `Bonus` | int  | Intimacy change when played (can be negative) |
-
----
-
-## HitAreas
-
-Interactive regions mapped to drawables in the model.
-
-```jsonc
-[
-  { "Name": "TouchHead", "Id": "TouchHead", "Motion": "触摸:摸头", "Order": 5 },
-  { "Name": "背景", "Id": "ArtMesh47", "Motion": "Tap背景", "Order": -1 },
-  { "Name": "TouchDrag1", "Id": "TouchDrag1", "Motion": "选项:选项" },
-]
-```
-
-| Field     | Type   | Description                                                                                                                                         |
-| --------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Name`    | string | Display name of the hit area                                                                                                                        |
-| `Id`      | string | Drawable/mesh ID in the Cubism model. Standard IDs: `TouchHead`, `TouchBody`, `TouchSpecial`, `TouchDrag1`-`TouchDrag10`, `TouchIdle1`-`TouchIdle7` |
-| `Motion`  | string | Motion group triggered on interaction. Format: `"Group"` (random entry) or `"Group:EntryName"` (specific entry)                                     |
-| `Order`   | int    | Z-priority for overlapping hit areas. **Higher = checked first**. Range: -1 to 10                                                                   |
-| `Enabled` | bool   | Set to `false` to disable the hit area                                                                                                              |
-
-Entries without `Id` are non-geometry triggers (UI buttons, menu items) that the viewer maps to soft controls rather than model mesh regions.
-
-### Motion Reference Format
-
-Used in `HitArea.Motion`, `NextMtn`, `PreMtn`, `Choices[].NextMtn`, `MaxMtn`, `EndMtn`, `BeginMtn`, and `start_mtn` commands:
-
-- **`"GroupName"`** — play a random entry from the group (respecting Weight and VarFloats conditions)
-- **`"GroupName:EntryName"`** — play the specific entry whose `Name` field matches
-
----
+All condition checks must pass before the motion event is eligible. Value
+operations run after the event is triggered. Variable names such as `idle` or
+`status` are model-defined state, not universal Live2DViewerEX variables.
 
 ## Controllers
 
-Behavior controllers that automate model interactions.
+Controllers are evaluated at the controller stage in the frame order. Rive2d
+should preserve the controller's enabled state and item order.
 
 ### ParamHit
 
-Drag-to-parameter mapping: dragging on a hit area changes a Live2D parameter value.
+`ParamHit` uses mouse operations to control model parameters. It is separate
+from a click action and must be evaluated continuously while the pointer is
+held.
 
 ```jsonc
 {
@@ -256,392 +237,118 @@ Drag-to-parameter mapping: dragging on a hit area changes a Live2D parameter val
     "Enabled": true,
     "Items": [
       {
-        "Name": "underwear_drag",
-        "Id": "touch_drag1", // Live2D parameter ID to control
-        "HitArea": "TouchDrag1", // which hit area triggers this
-        "Axis": 0, // 0 = horizontal, 1 = vertical
-        "Factor": -0.03, // drag sensitivity (negative = inverted)
-        "ReleaseType": 0, // 0 = spring back, 1 = spring back (timed), 2 = stay, 3 = sticky/persistent
-        "Release": 100, // spring-back duration (ms)
-        "LockParam": false, // lock parameter during drag
-        "MaxMtn": "扯内裤", // motion when param reaches max
-        "EndMtn": "drag_end", // motion when drag ends
-        "BeginMtn": "drag_start", // motion when drag begins
-        "LowPriority": false, // lower priority for this handler
-        "Weight": 0.5, // drag weight/damping
-        "Type": 2, // drag type
-        "Enabled": true,
-      },
-    ],
-  },
-}
-```
-
-| Field         | Type   | Description                                                                                         |
-| ------------- | ------ | --------------------------------------------------------------------------------------------------- |
-| `Id`          | string | Live2D parameter ID to control. May not exist in the .moc3 — see **Virtual Parameters** below       |
-| `HitArea`     | string | Hit area Name that activates this drag                                                              |
-| `Axis`        | int    | `0` = horizontal (X: right=increase, left=decrease), `1` = vertical (Y: down=increase, up=decrease) |
-| `Factor`      | float  | Parameter value change per pixel. Effective change = `Factor × modelScale`. Negative inverts direction |
-| `ReleaseType` | int    | `0` = spring back to default, `1` = spring back (timed), `2` = stay at value, `3` = sticky/persistent |
-| `Release`     | int    | Spring-back animation duration in ms                                                                |
-| `LockParam`   | bool   | Lock the parameter (prevent other controllers from changing it) during drag                         |
-| `MaxMtn`      | string | Motion triggered when parameter reaches its maximum value                                           |
-| `MinMtn`      | string | Motion triggered when parameter reaches its minimum value (legacy format)                           |
-| `EndMtn`      | string | Motion triggered when drag ends                                                                     |
-| `BeginMtn`    | string | Motion triggered when drag begins (first drag movement)                                             |
-| `LowPriority` | bool   | Lower priority for this drag handler                                                                |
-| `Weight`      | float  | Drag weight/damping factor                                                                          |
-
-#### Virtual Parameters (Non-Existent Id)
-
-When `Id` references a parameter that doesn't exist in the .moc3 file, ParamHit operates in **drag scrub mode**:
-
-- A virtual parameter value is tracked internally (not applied to the model)
-- `MaxMtn` animation starts immediately on pointerdown and is **scrubbed** based on drag distance
-- `Axis` and `Factor` define the drag-to-progress curve (how many pixels of drag = full animation progress)
-- On release **outside** the hit area: animation plays to completion
-- On release **inside** the hit area: behavior depends on `ReleaseType`:
-  - Type 0/1 (spring back): animation reverts (cancelled)
-  - Type 2/3 (stay/sticky): animation continues from current position
-
-This is the mechanism used by TouchDrag hit areas to scrub animations forward/backward based on drag distance from the initial click point.
-
-### ParamLoop
-
-Automatic looping parameter animations (e.g., swaying, floating effects).
-
-```jsonc
-{
-  "ParamLoop": {
-    "Enabled": true,
-    "Items": [{ "Ids": ["Param4"], "Type": 0, "Duration": 6000 }],
-  },
-}
-```
-
-| Field       | Type  | Description                                         |
-| ----------- | ----- | --------------------------------------------------- |
-| `Id`        | string | Single parameter ID (legacy format)                |
-| `Ids`       | array | Parameter IDs to animate                            |
-| `Type`      | int   | Waveform: `0` = sine, `1` = triangle/sawtooth       |
-| `Duration`  | int   | Loop period in ms                                   |
-| `BlendMode` | int   | `0` = overwrite parameter, `1` = additive blending  |
-
-### KeyTrigger
-
-Keyboard key to motion mapping.
-
-```jsonc
-{
-  "KeyTrigger": {
-    "Enabled": true,
-    "Items": [{ "Input": 72, "DownMtn": "menu" }],
-  },
-}
-```
-
-| Field     | Type   | Description                         |
-| --------- | ------ | ----------------------------------- |
-| `Input`   | int    | JavaScript keyCode                  |
-| `DownMtn` | string | Motion group triggered on key press |
-
-### EyeBlink
-
-```jsonc
-{
-  "EyeBlink": {
-    "Enabled": true,
-    "MinInterval": 500, // min time between blinks (ms)
-    "MaxInterval": 6000, // max time between blinks (ms)
-    "Items": [
-      // optional custom parameter mappings
-      {
-        "Id": "ParamEyeLOpen",
-        "Min": 0.0,
-        "Max": 1.0,
-        "BlendMode": 2,
-        "Input": 0,
-      },
-    ],
-  },
-}
-```
-
-If `Items` is absent, uses standard Cubism EyeBlink parameters from `Groups`.
-
-### LipSync
-
-```jsonc
-{
-  "LipSync": {
-    "Enabled": true,
-    "Gain": 10.0, // audio amplification
-    "SmoothTime": 0.075, // smoothing factor
-    "Items": [{ "Id": "ParamMouthOpenY", "Min": 0.0, "Max": 1.0, "Input": 0 }],
-  },
-}
-```
-
-### MouseTracking
-
-```jsonc
-{
-  "MouseTracking": {
-    "Enabled": true,
-    "SmoothTime": 0.15,
-    "Items": [
-      {
+        "Name": "head_drag",
+        "HitArea": "TouchDrag1",
         "Id": "ParamAngleX",
-        "Min": -30.0,
-        "Max": 30.0,
-        "Axis": 0, // 0 = X, 1 = Y
-        "BlendMode": 1, // 1 = additive
-        "Input": 0,
-        "DefaultValue": 0.0,
-        "Inverted": false,
-      },
-    ],
-  },
+        "Axis": 0,
+        "Factor": 0.04,
+        "Type": "Drag",
+        "LockParam": true,
+        "Release": 300,
+        "ReleaseType": 0,
+        "Weight": 1,
+        "BeginMtn": "Drag:start",
+        "MinMtn": "Drag:min",
+        "MaxMtn": "Drag:max",
+        "EndMtn": "Drag:end",
+        "Enabled": true
+      }
+    ]
+  }
 }
 ```
 
-### ParamValue
+| Property | Official meaning |
+| --- | --- |
+| `Name` | Item name. |
+| `HitArea` | Area that starts the parameter interaction. |
+| `Id` | Parameter ID to modify. |
+| `MinValue`, `MaxValue` | Optional parameter interaction limits; absent values use model limits. |
+| `Type` | `Drag`, `Stroke`, or `Hold`. |
+| `Axis` | Mouse X/Y axis used by the operation. |
+| `Factor` | Drag/stroke change per mouse pixel, or hold change per second. |
+| `LockParam` | Parameter remains at its value after release. This is persistence after release, not merely a drag-time lock. |
+| `Release` | Time taken for the value to return after release. |
+| `ReleaseType` | Animation curve used for the return. It does not mean keep versus restore. |
+| `Weight` | Influence of the parameter-hit value on the model. |
+| `MinMtn` / `MaxMtn` | Motion at the configured minimum/maximum. |
+| `BeginMtn` | Motion when the left button starts the interaction. |
+| `EndMtn` | Motion when the mouse is released without reaching the maximum. |
+| `LowPriority` | Prevents a low-priority item from overriding physics effects. |
+| `Enabled` | Whether the item is active. |
 
-Static parameter presets (toggleable accessories, states).
+`Factor` is a pointer-input multiplier. It must not be multiplied by the
+rendered model scale unless a separate, documented compatibility mode requires
+that behavior. `MinValue` and `MaxValue` are parameter values, not screen
+coordinates.
 
-```jsonc
-{
-  "ParamValue": {
-    "Enabled": true,
-    "Items": [
-      {
-        "Name": "Ring",
-        "Ids": ["Paramring"],
-        "Value": 1.0,
-        "KeyValues": [
-          { "Key": "Show", "Value": 1.0 },
-          { "Key": "Hide", "Value": 0.0 },
-        ],
-        "Hidden": false,
-      },
-    ],
-  },
-}
-```
+### Other controllers
 
-### ParamTrigger
+The official editor also defines `ParamLoop`, `ParamValue`, `PartOpacity`,
+`ArtmeshOpacity`, `ArtmeshColor`, `ParamTrigger`, `AreaTrigger`,
+`GestureTrigger`, `MouseTracking`, `LipSync`, `Blinking`, `Auto Breathing`,
+and related tracking/physics controllers. Their item properties must be
+normalized from the editor fields rather than inferred from group names.
 
-Triggers motions when a parameter crosses a threshold.
+Important trigger semantics:
 
-```jsonc
-{
-  "ParamTrigger": {
-    "Enabled": true,
-    "Items": [
-      {
-        "Name": "Sword",
-        "Id": "Paramtouch_idle1",
-        "Items": [{ "Value": 1.5, "Direction": 0, "Motion": "transform" }],
-      },
-    ],
-  },
-}
-```
-
-| Field               | Type   | Description             |
-| ------------------- | ------ | ----------------------- |
-| `Id`                | string | Parameter ID to watch   |
-| `Items[].Value`     | float  | Threshold value         |
-| `Items[].Direction` | int    | `0` = any direction     |
-| `Items[].Motion`    | string | Motion group to trigger |
-
-### PartOpacity
-
-Controls visibility of model parts.
-
-```jsonc
-{
-  "PartOpacity": {
-    "Enabled": true,
-    "Items": [
-      { "Name": "Background", "Ids": ["Part3", "Part88"], "Value": 1.0 },
-    ],
-  },
-}
-```
-
-### ArtmeshOpacity
-
-Controls visibility of individual art meshes (finer-grained than PartOpacity).
-
-```jsonc
-{
-  "ArtmeshOpacity": {
-    "Enabled": true,
-    "Items": [
-      {
-        "Name": "Lighting",
-        "Ids": ["ArtMesh172"],
-        "Value": 1.0,
-        "Hidden": true,
-      },
-    ],
-  },
-}
-```
-
-### Simple Toggle Controllers
-
-These controllers only have an `Enabled` field:
-
-| Controller      | Description                                                  |
-| --------------- | ------------------------------------------------------------ |
-| `AutoBreath`    | Automatic breathing animation via `ParamBreath`              |
-| `ExtraMotion`   | Layer additional idle motions from `Idle#1`, `Idle#2` groups |
-| `Accelerometer` | Device tilt input (mobile only)                              |
-| `FaceTracking`  | Face tracking via camera                                     |
-
-### Placeholder Controllers
-
-These exist in the JSON but are always empty objects (reserved for future/platform-specific use):
-
-`Microphone`, `Transform`, `AreaTrigger`, `HandTrigger`, `HandTracking`, `ArtmeshColor`, `ArtmeshCulling`
-
-### IntimacySystem
-
-Global affection tracking.
-
-```jsonc
-{
-  "IntimacySystem": {
-    "Enabled": true,
-    "InitValue": 50,
-    "MinValue": 0,
-    "MaxValue": 100,
-    "BonusActive": 5, // intimacy gained per active period
-    "BonusInactive": -1, // intimacy change when inactive
-    "BonusLimit": 0,
-  },
-}
-```
-
-Works with the `Intimacy` field on individual motion entries to gate which motions can play based on current intimacy level.
-
----
-
-## Options
-
-```jsonc
-{
-  "Options": {
-    "ScaleFactor": 0.1, // default model scale
-    "PositionX": 0.0, // default X position offset
-    "PositionY": 0.0, // default Y position offset
-    "TexFixed": true, // prevent dynamic texture replacement
-    "TexType": 0, // texture filtering type
-    "AnisoLevel": 4, // anisotropic filtering level
-    "MaskBufferSize": 4096, // mask buffer size for rendering
-    "AllowMod": false, // allow user modifications
-    "Name": "model_name", // display name override
-  },
-}
-```
-
----
-
-## Groups (Cubism Standard)
-
-Standard Cubism SDK parameter groupings. Used as fallback when `Controllers.EyeBlink.Items` or `Controllers.LipSync.Items` are not defined.
-
-```jsonc
-[
-  {
-    "Target": "Parameter",
-    "Name": "EyeBlink",
-    "Ids": ["ParamEyeLOpen", "ParamEyeROpen"],
-  },
-  {
-    "Target": "Parameter",
-    "Name": "LipSync",
-    "Ids": ["ParamMouthOpenY"],
-    "Axes": ["X"],
-    "Factors": [0.0],
-  },
-]
-```
-
-| Field     | Type   | Description                                          |
-| --------- | ------ | ---------------------------------------------------- |
-| `Target`  | string | `"Parameter"` or `"ArtmeshOpacity"`                  |
-| `Name`    | string | Group purpose: `"EyeBlink"`, `"LipSync"`, `"LookAt"` |
-| `Ids`     | array  | Parameter/artmesh IDs in this group                  |
-| `Axes`    | array  | Axis mapping per ID                                  |
-| `Factors` | array  | Scale factors per ID                                 |
-| `Value`   | float  | Default value                                        |
-
----
+- `ParamTrigger` fires when a parameter crosses a configured value in the
+  configured direction.
+- `AreaTrigger` continuously checks target/trigger-area overlap and fires its
+  enter/exit motions; this can have a measurable per-frame cost.
+- `ParamLoop` changes parameters over time and can use system-time
+  synchronization.
+- If a controller's item list is empty, the documented default parameter list
+  applies, such as `ParamAngleX` for mouse tracking or `ParamMouthOpenY` for
+  lip sync.
 
 ## Command Language
 
-The `Command` and `PostCommand` fields on motion entries use a mini command language. Multiple commands are chained with `;`.
+Command arguments are separated by spaces. Escape spaces in IDs or paths with
+backslashes. Multiple commands are separated by semicolons.
 
+```text
+parameters lock ParamAngleX 10 500;motions disable Tap:voice
 ```
-mouse_tracking disable;parameters lock Paramring 0
-stop_mtn;physics disable;eye_blink disable
-```
 
-### Commands
+The official command families include:
 
-| Command                    | Syntax                                       | Description                       |
-| -------------------------- | -------------------------------------------- | --------------------------------- |
-| **Parameter Control**      |                                              |                                   |
-| `parameters lock`          | `parameters lock <id> <value> [duration_ms]` | Lock parameter to value           |
-| `parameters lock`          | `parameters lock <id1>,<id2> <value>`        | Lock multiple parameters          |
-| `parameters lock`          | `parameters lock <id> $<var> [duration]`     | Lock parameter to variable value  |
-| `parameters unlock`        | `parameters unlock <id1>[,<id2>,...]`        | Unlock parameter(s)               |
-| `parameters set`           | `parameters set <id> <value>`                | Set parameter value (one-time)    |
-| **Motion Control**         |                                              |                                   |
-| `start_mtn`                | `start_mtn <group>[:<name>]`                 | Start a motion                    |
-| `stop_mtn`                 | `stop_mtn`                                   | Stop current motion               |
-| `motions enable`           | `motions enable <group>`                     | Enable a motion group             |
-| `motions disable`          | `motions disable <group>`                    | Disable a motion group            |
-| **Controller Toggles**     |                                              |                                   |
-| `mouse_tracking`           | `mouse_tracking <enable\|disable>`           | Toggle mouse tracking             |
-| `physics`                  | `physics <enable\|disable>`                  | Toggle physics                    |
-| `eye_blink`                | `eye_blink <enable\|disable\|enforce>`       | Toggle eye blink                  |
-| `lip_sync`                 | `lip_sync <enable\|enforce>`                 | Toggle lip sync                   |
-| **ParamHit Control**       |                                              |                                   |
-| `param_hit enable`         | `param_hit enable <id1>[,<id2>,...]`         | Enable param hit items            |
-| `param_hit disable`        | `param_hit disable <id1>[,<id2>,...]`        | Disable param hit items           |
-| `param_hit lock`           | `param_hit lock <ids>`                       | Lock param hit items              |
-| `param_hit unlock`         | `param_hit unlock <ids>`                     | Unlock param hit items            |
-| `hit_areas disable`        | `hit_areas disable`                          | Disable all hit areas             |
-| **Visual Control**         |                                              |                                   |
-| `replace_tex`              | `replace_tex <index> <file.png>`             | Replace texture at index          |
-| `parts set`                | `parts set <partId> <value>`                 | Set part opacity                  |
-| `parts lock`               | `parts lock <partId> <value>`                | Lock part opacity                 |
-| `artmesh_opacities lock`   | `artmesh_opacities lock <id> <value>`        | Lock artmesh opacity              |
-| `artmesh_opacities unlock` | `artmesh_opacities unlock <id>`              | Unlock artmesh opacity            |
-| `artmesh_opacities set`    | `artmesh_opacities set <id1>,<id2> <value>`  | Set artmesh opacity               |
-| `artmeshes lock`           | `artmeshes lock <id> <value>`                | Lock artmesh                      |
-| **Audio**                  |                                              |                                   |
-| `mute_sound`               | `mute_sound <0\|1>`                          | Mute (1) / unmute (0) sound       |
-| `stop_sound`               | `stop_sound <channel>`                       | Stop sound on channel             |
-| **Other**                  |                                              |                                   |
-| `open_url`                 | `open_url <url>`                             | Open URL in browser               |
-| `change_cos`               | `change_cos <model3.json>`                   | Switch to different costume/model |
+| Command | Meaning |
+| --- | --- |
+| `open_url` | Open a browser link. |
+| `change_model` | Change model configuration. |
+| `add_submodel` / `remove_submodel` | Add or remove a submodel. |
+| `start_mtn` | Force a motion at priority 9. The model ID is optional. |
+| `stop_mtn` | Stop motions at a layer; default layer is 0. |
+| `set_exp`, `next_exp`, `clear_exp` | Set, advance, or clear expressions. |
+| `replace_tex` | Replace a texture by index. |
+| `stop_sound`, `stop_all_sounds`, `mute_sound`, `unmute_sound` | Control sound playback. |
+| `hide_text` | Hide displayed text. |
+| `parameters lock` | Persistently lock a parameter to a literal, `$variable`, or `@parameter` value. An optional duration controls fade-in. |
+| `parameters set` | Assign a parameter once; unlike `lock`, it is not persistent. |
+| `parameters unlock` | Unlock one parameter or all parameters. |
+| `animations lock` | Lock an animation layer at a progress value. |
+| `motions enable` / `motions disable` | Enable or disable a motion event/group. |
+| `hit_areas enable` / `hit_areas disable` | Enable or disable a named hit area. |
+| `param_hit enable` / `disable` / `lock` / `unlock` / `begin` / `end` | Control ParamHit items and drag lifecycle. |
+| `physics enable` / `disable` | Toggle physics. |
+| `eye_blink enable` / `disable` / `enforce` | Toggle or enforce blinking. |
+| `lip_sync enable` / `disable` / `enforce` | Toggle or enforce lip sync. |
 
----
+Unknown commands should produce a debug diagnostic and remain otherwise
+side-effect free. A command must not be reinterpreted as a motion completion
+rule merely because its text contains a state-like word.
 
-## Appendix: Leave Group Naming
+## Rive2d Adapter Contract
 
-`Leave{Interval}_{MinDuration}_{MaxDuration}` — all values in seconds.
+The adapter may provide project-specific compatibility behavior, including:
 
-| Example         | Triggers After | Lasts       |
-| --------------- | -------------- | ----------- |
-| `Leave30_30_30` | 30s idle       | exactly 30s |
-| `Leave60_40_60` | 60s idle       | 40-60s      |
-| `Leave600_1_1`  | 10min idle     | 1s          |
+- lower-case and legacy field aliases;
+- motion-file caching and resource decryption;
+- normalization of action fields into click/press/release/enter/exit routes;
+- runtime logging and validation of unresolved references.
 
-After the user is idle for `Interval` seconds, a random motion from the group plays. `MinDuration`/`MaxDuration` control how long the timed idle state persists before returning to normal idle.
+These are implementation details, not Live2DViewerEX JSON semantics. In
+particular, virtual parameters, guessed drag scrubbing, name-based completion,
+and automatic resets must not be documented or implemented as official model
+behavior unless the model JSON explicitly declares them.

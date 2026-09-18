@@ -1,6 +1,12 @@
 # Model Interaction Inventory
 
-This document records the interaction patterns found in the imported model library and the execution contract used by Rive2d.
+This document has two deliberately separate parts:
+
+1. The official Live2DViewerEX interaction semantics used by the parser.
+2. A dated, empirical inventory of the models currently available locally.
+
+The official rules are normative. The local inventory is evidence for
+compatibility work and must not be used to invent behavior for another model.
 
 Scan date: 2026-09-12
 
@@ -8,11 +14,18 @@ Scan date: 2026-09-12
 
 Reference documentation:
 
+`docs/reference/live2d-editor/live2d-editor.html`
+
+Online source:
+
 `https://live2d.pavostudio.com/doc/en-us/exstudio/live2d-editor/`
 
 The following meanings are taken from the Live2D Editor JSON Editor
 documentation. These definitions take priority over field names, naming
-conventions, or behavior inferred from a motion group name.
+conventions, or behavior inferred from a motion group name. The parser may
+normalize legacy spellings such as `motions`/`Motions`, `hit_areas`/`HitAreas`,
+and editor labels such as `Lock Parameter`, but normalization must not change
+the semantics.
 
 ### Runtime execution order
 
@@ -29,6 +42,35 @@ This order matters for `ParamHit`: the held pointer value must be applied at
 the controller stage, after motion evaluation and before physics. A later
 motion or controller may still override a value depending on layer, priority,
 weight, and lock settings.
+
+### Motion completion
+
+The official completion rules are:
+
+- `PostCommand` runs after a non-looping motion finishes.
+- `NextMtn` selects the next motion after the current motion finishes.
+- Looping motions do not emit end-of-motion events, including `PostCommand` and
+  `NextMtn`.
+- When no explicit next motion interrupts a layer that has an `Idle` motion,
+  the layer returns to that layer's idle motion.
+- A layer without `Idle` stops at the last frame.
+
+This means a motion does not automatically return to the model's initial idle
+state. A reset to `Idle:0`, a state-variable reset, or a final action must be
+declared by the model JSON. Rive2d must not infer a completion route from names
+such as `mission_complete`, `finish`, or `touch_drag`.
+
+### Hit-area semantics
+
+The official hit-area properties are `Name`, `ID`, sorting/order,
+`Clickable When Invisible`, click/press/release/enter/exit actions, and
+`Enabled`. An ArtMesh normally needs visible content to receive an event;
+`Clickable When Invisible` is the explicit exception. Release actions can be
+reported outside the original area.
+
+A model's serialized action field may be named `Motion`. The adapter must map
+it to the correct event action and must not use it as an implicit press,
+release, or drag route when the JSON does not declare one.
 
 ### ParamHit
 
@@ -50,7 +92,7 @@ click mapping and it is not, by itself, a request to play a motion file.
 | `Release` | Duration used when the parameter is released and configured to return. |
 | `ReleaseType` | Release/interpolation curve selection. It does not mean “restore” versus “keep”. |
 | `BeginMtn` | Motion/action associated with beginning the parameter interaction, when present. |
-| `MaxMtn` / `MinMtn` | Motion/action route associated with reaching the configured maximum/minimum. The route may be an `Option` that changes state with `VarFloats` before starting an `Action`. |
+| `MaxMtn` / `MinMtn` | Motion/action route associated with reaching the configured maximum/minimum. Resolve the reference through the same group/name and condition rules as other motion references. |
 | `EndMtn` | Motion/action associated with releasing the interaction without reaching the parameter's maximum value. |
 
 The release decision must therefore be interpreted in this order:
@@ -85,6 +127,13 @@ value cannot directly move the model window outside the screen.
 The model position is a separate runtime concern. `currentModel.x` and
 `currentModel.y` need an explicit viewport-boundary policy if the entire model
 must remain visible.
+
+## Local Inventory (Non-Normative)
+
+The following scan and runtime notes describe the local model library only.
+They are useful for regression coverage, but they do not override the
+official semantics above or define behavior for models that are not in this
+scan.
 
 ### Local model coverage
 
@@ -126,6 +175,12 @@ The scan covered the 66 model paths registered in the local Rive2d database.
 - 118 `ParamHit` rules, 12 `ParamLoop` rules, 1 `ParamTrigger` rule, and 25 `KeyTrigger` rules were found.
 
 The parser must normalize field names before interpreting behavior. Do not assume that a model is Cubism 3 just because it has a `.model.json` extension.
+
+## Rive2d Adapter Inventory
+
+The remaining sections describe the current Rive2d adapter and its observed
+model patterns. They are implementation guidance, not additional
+Live2DViewerEX JSON rules.
 
 ## Motion Entry Types
 
