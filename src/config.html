@@ -33,7 +33,7 @@
   <div id="app"></div>
   <div id="app-error"></div>
   <script type="module">
-    import('./config/main.js').catch(err => {
+    import('./config/main.ts').catch(err => {
       const el = document.getElementById('app-error');
       el.style.display = 'block';
       el.textContent = 'Failed to load config app:\n' + err.message + '\n' + err.stack;

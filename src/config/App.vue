@@ -1,57 +1,95 @@
-<script setup>
-import { ref, computed, onMounted } from 'vue';
+<script setup lang="ts">
+import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 
-const activeTab = ref('models');
-const models = ref([]);
-const currentModel = ref(null);
+interface AppConfig {
+  models: string[];
+  current_model: string | null;
+  show_border: boolean;
+  tap_motion: boolean;
+  right_click_motion: boolean;
+  show_hit_areas: boolean;
+  lock_model: boolean;
+  mouse_tracking: boolean;
+}
+
+interface HitAreaInfo {
+  name: string;
+  id: string;
+  default_motion: string | null;
+}
+
+interface ModelInfo {
+  hit_areas: HitAreaInfo[];
+  motion_groups: string[];
+  custom_name: string | null;
+  custom_motions: string | null;
+}
+
+interface ImportProgress {
+  current: number;
+  total: number;
+  name: string;
+}
+
+interface ImportResult {
+  imported: number;
+  skipped: number;
+  errors: string[];
+}
+
+const activeTab = ref<'models' | 'settings'>('models');
+const models = ref<string[]>([]);
+const currentModel = ref<string | null>(null);
 const showBorder = ref(false);
 const tapMotion = ref(true);
 const rightClickMotion = ref(false);
 const showHitAreas = ref(false);
 const lockModel = ref(false);
 const mouseTracking = ref(true);
-const previews = ref({});
+const previews = ref<Record<string, string>>({});
 
 // Detail view state
-const detailModel = ref(null);   // path being edited, null = list view
-const modelInfo = ref(null);     // from get_model_info
+const detailModel = ref<string | null>(null);
+const modelInfo = ref<ModelInfo | null>(null);
 const editName = ref('');
-const editMotions = ref({});     // { hitAreaName: motionGroup }
-const customNames = ref({});     // { path: name } for all models
+const editMotions = ref<Record<string, string>>({});
+const customNames = ref<Record<string, string>>({});
 
-async function loadPreviews(modelPaths) {
+async function loadPreviews(modelPaths: readonly string[]): Promise<void> {
   for (const path of modelPaths) {
     if (previews.value[path]) continue;
     try {
-      const texturePath = await invoke('get_model_preview', { path });
-      if (texturePath) {
+      const texturePath = await invoke<string | null>('get_model_preview', { path });
+      if (texturePath !== null && texturePath !== undefined) {
         previews.value[path] = 'model://localhost/' + texturePath;
       }
     } catch {}
   }
 }
 
-async function loadCustomNames(modelPaths) {
+async function loadCustomNames(modelPaths: readonly string[]): Promise<void> {
   try {
-    const names = await invoke('get_model_names', { paths: modelPaths });
+    const names = await invoke<Record<string, string>>('get_model_names', { paths: modelPaths });
     customNames.value = names;
   } catch {}
 }
 
-function displayName(path) {
+function displayName(path: string): string {
   return customNames.value[path] || fileName(path);
 }
 
-async function openDetail(path) {
+async function openDetail(path: string): Promise<void> {
   try {
-    const info = await invoke('get_model_info', { path });
+    const info = await invoke<ModelInfo>('get_model_info', { path });
     modelInfo.value = info;
     editName.value = info.custom_name || '';
     // Build motions edit state from saved custom mappings
-    const saved = info.custom_motions ? JSON.parse(info.custom_motions) : {};
+    const saved: Record<string, string> = info.custom_motions
+      ? JSON.parse(info.custom_motions) as Record<string, string>
+      : {};
     editMotions.value = {};
     for (const ha of info.hit_areas) {
       editMotions.value[ha.name] = saved[ha.name] || '';
@@ -62,14 +100,14 @@ async function openDetail(path) {
   }
 }
 
-async function triggerMotion(group) {
+async function triggerMotion(group: string | null | undefined): Promise<void> {
   if (!group || group === '__none__') return;
   // group can be "GroupName" or "GroupName:index"
   const [g, idx] = group.split(':');
-  await invoke('trigger_motion', { group: g, index: idx !== undefined ? parseInt(idx) : null });
+  await invoke('trigger_motion', { group: g, index: idx !== undefined ? parseInt(idx, 10) : null });
 }
 
-async function saveDetail() {
+async function saveDetail(): Promise<void> {
   const path = detailModel.value;
   if (!path) return;
 
@@ -82,7 +120,7 @@ async function saveDetail() {
   }
 
   // Save motion mappings (only non-empty overrides)
-  const overrides = {};
+  const overrides: Record<string, string> = {};
   for (const [name, group] of Object.entries(editMotions.value)) {
     if (group) overrides[name] = group;
   }
@@ -91,14 +129,14 @@ async function saveDetail() {
   closeDetail();
 }
 
-function closeDetail() {
+function closeDetail(): void {
   detailModel.value = null;
   modelInfo.value = null;
 }
 
-async function refreshConfig() {
+async function refreshConfig(): Promise<void> {
   try {
-    const config = await invoke('get_config');
+    const config = await invoke<AppConfig>('get_config');
     models.value = config.models;
     currentModel.value = config.current_model;
     showBorder.value = config.show_border;
@@ -115,9 +153,9 @@ async function refreshConfig() {
 }
 
 const importing = ref(false);
-const importProgress = ref({ current: 0, total: 0, name: '' });
+const importProgress = ref<ImportProgress>({ current: 0, total: 0, name: '' });
 
-async function importModel() {
+async function importModel(): Promise<void> {
   const selected = await open({
     multiple: false,
     filters: [
@@ -125,9 +163,9 @@ async function importModel() {
       { name: 'Live2D Model JSON', extensions: ['json'] },
     ],
   });
-  if (!selected) return;
+  if (!selected || Array.isArray(selected)) return;
   importing.value = true;
-  importProgress.value = { current: 0, total: 1, name: selected.split('/').pop() };
+  importProgress.value = { current: 0, total: 1, name: selected.split('/').pop() || selected };
   try {
     await invoke('add_model', { path: selected });
     await refreshConfig();
@@ -138,16 +176,16 @@ async function importModel() {
   }
 }
 
-async function importFolder() {
+async function importFolder(): Promise<void> {
   const selected = await open({ directory: true });
-  if (!selected) return;
+  if (!selected || Array.isArray(selected)) return;
   importing.value = true;
   importProgress.value = { current: 0, total: 0, name: 'Scanning...' };
-  const unlisten = await listen('import-progress', (event) => {
+  const unlisten = await listen<ImportProgress>('import-progress', (event) => {
     importProgress.value = event.payload;
   });
   try {
-    const result = await invoke('add_models_from_dir', { path: selected });
+    const result = await invoke<ImportResult>('add_models_from_dir', { path: selected });
     if (result.errors.length > 0) {
       console.warn('Some imports failed:', result.errors);
     }
@@ -160,30 +198,30 @@ async function importFolder() {
   }
 }
 
-async function loadModel(path) {
+async function loadModel(path: string): Promise<void> {
   await invoke('apply_model', { path });
   await refreshConfig();
 }
 
-async function removeModel(path) {
+async function removeModel(path: string): Promise<void> {
   await invoke('remove_model', { path });
   await refreshConfig();
 }
 
-async function uploadPreview(modelPath) {
+async function uploadPreview(modelPath: string): Promise<void> {
   const selected = await open({
     multiple: false,
     filters: [
       { name: 'Image', extensions: ['png', 'jpg', 'jpeg', 'webp'] },
     ],
   });
-  if (selected) {
+  if (selected && !Array.isArray(selected)) {
     await invoke('set_model_preview', { modelPath, imagePath: selected });
     previews.value[modelPath] = 'model://localhost/' + selected;
   }
 }
 
-async function toggleTapMotion() {
+async function toggleTapMotion(): Promise<void> {
   tapMotion.value = !tapMotion.value;
   await invoke('set_setting', {
     key: 'tap_motion',
@@ -191,7 +229,7 @@ async function toggleTapMotion() {
   });
 }
 
-async function toggleRightClickMotion() {
+async function toggleRightClickMotion(): Promise<void> {
   rightClickMotion.value = !rightClickMotion.value;
   await invoke('set_setting', {
     key: 'right_click_motion',
@@ -199,7 +237,7 @@ async function toggleRightClickMotion() {
   });
 }
 
-async function toggleHitAreas() {
+async function toggleHitAreas(): Promise<void> {
   showHitAreas.value = !showHitAreas.value;
   await invoke('set_setting', {
     key: 'show_hit_areas',
@@ -207,7 +245,7 @@ async function toggleHitAreas() {
   });
 }
 
-async function toggleLockPosition() {
+async function toggleLockPosition(): Promise<void> {
   lockModel.value = !lockModel.value;
   await invoke('set_setting', {
     key: 'lock_model',
@@ -215,7 +253,7 @@ async function toggleLockPosition() {
   });
 }
 
-async function toggleMouseTracking() {
+async function toggleMouseTracking(): Promise<void> {
   mouseTracking.value = !mouseTracking.value;
   await invoke('set_setting', {
     key: 'mouse_tracking',
@@ -223,7 +261,7 @@ async function toggleMouseTracking() {
   });
 }
 
-async function toggleBorder() {
+async function toggleBorder(): Promise<void> {
   showBorder.value = !showBorder.value;
   await invoke('set_setting', {
     key: 'show_border',
@@ -231,7 +269,7 @@ async function toggleBorder() {
   });
 }
 
-const sortedModels = computed(() => {
+const sortedModels = computed<string[]>(() => {
   const cur = currentModel.value;
   if (!cur) return models.value;
   return [...models.value].sort((a, b) => {
@@ -241,21 +279,29 @@ const sortedModels = computed(() => {
   });
 });
 
-function fileName(path) {
-  return path.split('/').pop().replace(/\.(model3|model)\.json$/i, '');
+function fileName(path: string): string {
+  return (path.split('/').pop() || path).replace(/\.(model3|model)\.json$/i, '');
 }
 
+let stopNavigationListener: (() => void) | undefined;
+
 onMounted(() => {
-  refreshConfig();
-  listen('navigate-settings', async (event) => {
+  void refreshConfig();
+  void listen<string>('navigate-settings', async (event) => {
     const view = event.payload;
     await refreshConfig();
     if (view.startsWith('model_detail:')) {
       const path = view.substring('model_detail:'.length);
       activeTab.value = 'models';
-      openDetail(path);
+      await openDetail(path);
     }
+  }).then((unlisten) => {
+    stopNavigationListener = unlisten;
   });
+});
+
+onUnmounted(() => {
+  stopNavigationListener?.();
 });
 </script>
 

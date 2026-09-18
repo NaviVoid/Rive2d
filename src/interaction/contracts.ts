@@ -7,9 +7,7 @@ export interface RuntimeLogger {
   error(message: string, details?: unknown): void;
 }
 
-export interface EventMap {
-  [event: string]: unknown;
-}
+export type EventMap = object;
 
 export interface EventBus<Events extends EventMap> {
   on<K extends keyof Events>(event: K, listener: (payload: Events[K]) => void): () => void;
@@ -85,6 +83,8 @@ export interface ModelStatePort {
   lockParameter(name: string, value?: number): void;
   unlockParameter(name: string): void;
   isParameterLocked(name: string): boolean;
+  setMotionGroupEnabled(group: string, enabled: boolean): void;
+  setHitAreasEnabled(enabled: boolean): void;
   snapshot(): StateSnapshot;
   restore(snapshot: StateSnapshot): void;
 }

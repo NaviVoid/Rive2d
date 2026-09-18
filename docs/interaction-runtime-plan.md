@@ -2,11 +2,11 @@
 
 状态：第一阶段已实现，兼容迁移进行中
 
-目标：将模型交互从 `src/main.js` 中的过程式分支重构为 TypeScript 对象模型、状态机和行为树执行器。实现必须适用于不同模型，不得针对某个 LPK、动作名或参数 ID 编写特例。
+目标：将模型交互从 `src/main.ts` 中的过程式分支重构为 TypeScript 对象模型、状态机和行为树执行器。实现必须适用于不同模型，不得针对某个 LPK、动作名或参数 ID 编写特例。
 
 ## 1. 当前问题
 
-当前 `src/main.js` 同时负责以下职责：
+当前 `src/main.ts` 同时负责以下职责：
 
 - Pixi 指针事件和命中区域排序。
 - 普通点击、拖拽动作、ParamHit 拖拽和虚拟参数拖拽。
@@ -55,7 +55,7 @@
 
 ## 3. 目标模块结构
 
-本次重构直接迁移交互运行时至 TypeScript。当前已新增 `src/interaction/` 领域层，并由 `main.js` 通过适配器接入；后续逐步替换为 `main.ts`。Vite 继续负责编译。任何来自 JSON、PixiJS 或 Live2D engine 的动态数据必须在边界处转换为显式 TypeScript 类型；运行时内部不得使用无约束的 `any`。
+本次重构直接迁移交互运行时至 TypeScript。当前已新增 `src/interaction/` 领域层，并由 `main.ts` 通过适配器接入；主入口已完成文件迁移，后续继续进行类型收敛和旧逻辑拆分。Vite 继续负责编译。任何来自 JSON、PixiJS 或 Live2D engine 的动态数据必须在边界处转换为显式 TypeScript 类型；运行时内部不得使用无约束的 `any`。
 
 建议目录：
 
@@ -552,6 +552,14 @@ model.unloaded
 
 ## 9. 迁移步骤
 
+### 前端入口迁移
+
+- [x] 设置窗口入口从 `src/config/main.js` 迁移到 `src/config/main.ts`。
+- [x] `config/App.vue` 使用 `<script setup lang="ts">`，为 Tauri 配置、模型信息和导入事件增加显式类型。
+- [x] 宠物窗口入口从 `src/main.js` 迁移到 `src/main.ts`，保持兼容运行时行为不变。
+- [x] 安装并接入 `typescript` / `vue-tsc`，检查设置窗口和已迁移交互运行时模块。
+- [ ] 为 `main.ts` 的 Pixi、Tauri、Live2D 边界补齐类型并纳入完整静态检查。
+
 ### 第 1 步：抽离纯模型图和条件层
 
 - [x] 新增 TypeScript 规范化模型图、引用解析、条件和状态存储模块。
@@ -569,7 +577,7 @@ model.unloaded
 ### 第 3 步：抽离 MotionSession 和 CommandRuntime
 
 - [x] 新增 `Live2DCommandRuntime`，通过 `Live2DCommandHost` 隔离 Live2D、Pixi 和应用状态。
-- [x] `main.js` 的模型命令解析改为调用 TypeScript 命令运行时，保留现有命令语义和兼容播放器。
+- [x] `main.ts` 的模型命令解析改为调用 TypeScript 命令运行时，保留现有命令语义和兼容播放器。
 - [ ] 统一文件动作和命令动作生命周期。
 - [ ] 接管 `Command`、`PostCommand`、锁和回滚。
 - 删除 `pendingNextMtn` 的全局单值设计，改为链实例字段。
@@ -589,7 +597,7 @@ model.unloaded
 - 为每个链绑定 modelInstanceId 和 chainId。
 - 在模型卸载、动作取消、动作失败时取消旧链。
 
-### 第 6 步：替换 main.js 旧分支
+### 第 6 步：替换 main.ts 旧分支
 
 - `main.ts` 只保留适配和生命周期代码。
 - 删除旧的全局动作状态和重复条件判断。

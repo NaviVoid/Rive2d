@@ -56,7 +56,7 @@ make build      # build production binary
 
 Two windows, one Rust backend:
 
-- **Pet window** (`src/main.js`) — fullscreen transparent PixiJS 8 canvas rendering the Live2D model with drag, resize, tap, and parameter drag interactions
+- **Pet window** (`src/main.ts`) — fullscreen transparent PixiJS 8 canvas rendering the Live2D model with drag, resize, tap, and parameter drag interactions
 - **Settings window** (`src/config/App.vue`) — Vue 3 app for model import/removal, custom motion mapping, and global settings
 
 ### Rust Modules

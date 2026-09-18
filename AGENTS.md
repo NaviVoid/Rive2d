@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Rive2d is a Tauri 2 desktop pet for Linux/Wayland. Frontend source lives in `src/`: `main.js` drives the PixiJS pet window, while `config/App.vue` implements the Vue settings window. Shared styles and HTML entry points are also under `src/`. Rust backend code is in `src-tauri/src/`; keep Tauri commands and protocol setup in `lib.rs`, persistence in `config.rs`, LPK handling in `lpk.rs`, Wayland integration in `layer_shell.rs`, and tray behavior in `tray.rs`. Documentation and screenshots belong in `docs/`. Treat `dist/`, `node_modules/`, and `src-tauri/target/` as generated output.
+Rive2d is a Tauri 2 desktop pet for Linux/Wayland. Frontend source lives in `src/`: `main.ts` drives the PixiJS pet window, while `config/App.vue` implements the Vue settings window. Shared styles and HTML entry points are also under `src/`. Rust backend code is in `src-tauri/src/`; keep Tauri commands and protocol setup in `lib.rs`, persistence in `config.rs`, LPK handling in `lpk.rs`, Wayland integration in `layer_shell.rs`, and tray behavior in `tray.rs`. Documentation and screenshots belong in `docs/`. Treat `dist/`, `node_modules/`, and `src-tauri/target/` as generated output.
 
 ## Build, Test, and Development Commands
 
