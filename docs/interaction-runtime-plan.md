@@ -1,6 +1,6 @@
 # 交互运行时重构计划
 
-状态：计划阶段
+状态：第一阶段已实现，兼容迁移进行中
 
 目标：将模型交互从 `src/main.js` 中的过程式分支重构为 TypeScript 对象模型、状态机和行为树执行器。实现必须适用于不同模型，不得针对某个 LPK、动作名或参数 ID 编写特例。
 
@@ -55,7 +55,7 @@
 
 ## 3. 目标模块结构
 
-本次重构直接迁移交互运行时至 TypeScript。`main.js` 逐步替换为 `main.ts`，Vite 继续负责编译。任何来自 JSON、PixiJS 或 Live2D engine 的动态数据必须在边界处转换为显式 TypeScript 类型；运行时内部不得使用无约束的 `any`。
+本次重构直接迁移交互运行时至 TypeScript。当前已新增 `src/interaction/` 领域层，并由 `main.js` 通过适配器接入；后续逐步替换为 `main.ts`。Vite 继续负责编译。任何来自 JSON、PixiJS 或 Live2D engine 的动态数据必须在边界处转换为显式 TypeScript 类型；运行时内部不得使用无约束的 `any`。
 
 建议目录：
 
@@ -554,17 +554,17 @@ model.unloaded
 
 ### 第 1 步：抽离纯模型图和条件层
 
-- 新增 TypeScript 配置和规范化模型图模块。
-- 将引用解析、条件求值、状态存储从 `main.js` 移出。
+- [x] 新增 TypeScript 规范化模型图、引用解析、条件和状态存储模块。
+- [x] 通过 `ModelRuntime` 将 JSON 定义的点击路由接入旧播放器，保持现有动作副作用顺序。
 - 为 VarFloats、引用解析、Idle eligibility 增加纯函数测试。
-- 暂时由旧 `playMotion` 调用新模块，保持行为不变。
+- [x] 暂时由旧 `playMotion` 作为兼容动作适配器，避免 Command/PostCommand 重复执行。
 
 ### 第 2 步：实现资源预加载和模型对象
 
-- Rust 层增加按 LPK fingerprint 管理的资源包准备接口。
-- 加载时一次解密并展开模型资源清单，完成后返回缓存根目录或受控资源 URL。
-- 新增 `ResourcePreloader`、`ModelAdapter` 和 `ModelRuntime`。
-- 将模型卸载与资源包引用释放纳入 `AppRuntime` 状态机。
+- [x] Rust 层增加按 LPK fingerprint 管理的资源包准备接口。
+- [x] 加载时一次解密并展开模型资源清单，后续虚拟资源请求优先读取缓存。
+- [x] 新增 `ResourcePreloader`、`ModelAdapter` 和 `ModelRuntime`。
+- [x] 将模型卸载纳入 `AppRuntime` 状态机。
 
 ### 第 3 步：抽离 MotionSession 和 CommandRuntime
 

@@ -1,6 +1,10 @@
 import * as PIXI from 'pixi.js';
 import { Assets } from 'pixi.js';
 import { Live2DModel, Live2DPlugin, SoundManager } from 'untitled-pixi-live2d-engine';
+import { AppRuntime } from './interaction/appRuntime';
+import { TauriResourcePreloader } from './interaction/assetPreloader';
+import { ConsoleRuntimeLogger } from './interaction/logger';
+import { ModelRuntime } from './interaction/modelRuntime';
 
 // Expose PIXI globally for pixi-live2d-display
 window.PIXI = PIXI;
@@ -8,6 +12,9 @@ PIXI.extensions.add(Live2DPlugin);
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
+const interactionLogger = new ConsoleRuntimeLogger('interaction');
+const appRuntime = new AppRuntime(interactionLogger);
+const resourcePreloader = new TauriResourcePreloader(invoke, interactionLogger);
 
 // Forward console logs to backend log file
 const logStartedAt = performance.now();
@@ -77,6 +84,7 @@ const canvas = document.getElementById('canvas');
 const app = new PIXI.Application();
 
 let currentModel = null;
+let modelRuntime = null;
 let showBorder = false;
 let tapMotion = true;
 let rightClickMotion = false;
@@ -2173,6 +2181,8 @@ async function loadModel(modelPath) {
   intimacyValue = 50;
 
   if (currentModel) {
+    appRuntime.detachModel();
+    modelRuntime = null;
     app.ticker.remove(drawHitAreas);
     hitAreaGfx.clear();
     for (const label of hitAreaLabels) label.visible = false;
@@ -2188,6 +2198,9 @@ async function loadModel(modelPath) {
   }
 
   try {
+    // LPK assets are decrypted/extracted once before the webview starts
+    // requesting textures, motions, physics and expressions.
+    await resourcePreloader.prepare(modelPath);
     const model = await Live2DModel.from(modelPath, {
       autoHitTest: false,
       autoFocus: mouseTracking,
@@ -2338,7 +2351,8 @@ async function loadModel(modelPath) {
       dragInteractionId = interactionId;
       dragStart.x = e.global.x;
       dragStart.y = e.global.y;
-      const dragMotionConsumed = triggerDragMotions();
+      const dragMotionConsumed = modelRuntime?.handleHit('down', dragHitNames, e.button)
+        || triggerDragMotions();
 
       traceLog('touch', 'model-down', {
         interactionId,
@@ -2384,6 +2398,18 @@ async function loadModel(modelPath) {
       customJsonStr = await invoke('get_custom_motions', { path: currentModelPath });
     } catch {}
     buildHitMotionMap(metadata.hitAreas, customJsonStr);
+    modelRuntime = new ModelRuntime({
+      id: modelPath,
+      rawJson,
+      logger: interactionLogger,
+      // playMotion is still the compatibility adapter and owns Command,
+      // PostCommand and NextMtn side effects until the native TS player lands.
+      executeCommands: false,
+      resolveHitRoute: name => hitMotionMap[name],
+      isDragHitArea,
+      dispatchMotion: (route, options) => playMotion(route.group, route.index, options?.priority),
+    });
+    appRuntime.attachModel(modelRuntime);
     pendingNextMtn = null;
 
     // Parse controllers
@@ -2804,6 +2830,12 @@ async function loadModel(modelPath) {
       console.log(`[touch] pointertap — hit areas: [${hitAreaNames.join(', ')}]`);
       if (hitAreaNames.length === 0) {
         console.log('[touch] pointertap — no hit area at click position');
+      }
+      // The TypeScript interaction runtime owns JSON-defined routes. Keep
+      // custom mappings and legacy fallbacks below for compatibility.
+      if (modelRuntime && modelRuntime.handleHit('tap', hitAreaNames, e.button)) {
+        console.log('[touch] pointertap — handled by interaction runtime');
+        return;
       }
       const dragHitName = hitAreaNames.find(name => isDragHitArea(name));
       if (dragHitName) {

@@ -23,7 +23,7 @@ struct RenameMapCacheEntry {
 }
 
 static RENAME_MAP_CACHE: OnceLock<Mutex<HashMap<String, RenameMapCacheEntry>>> = OnceLock::new();
-static DEBUG_CACHE_PATHS: OnceLock<Mutex<HashMap<String, (ArchiveFingerprint, PathBuf)>>> =
+static EXTRACTION_CACHE_PATHS: OnceLock<Mutex<HashMap<String, (ArchiveFingerprint, PathBuf)>>> =
     OnceLock::new();
 
 /// Return the virtual model entry used when an LPK is loaded without extraction.
@@ -42,19 +42,37 @@ pub fn direct_model_path(lpk_path: &str) -> Result<String, String> {
     Ok(virtual_path(lpk_path, &entry))
 }
 
+/// Prepare the complete extracted asset cache for an LPK before the webview
+/// starts loading the model. This keeps decryption and archive traversal out
+/// of the motion/texture request path.
+pub fn prepare_model_assets(path: &str) -> Result<(), String> {
+    let lpk_path = split_virtual_path(path)
+        .map(|(archive, _)| archive.to_string())
+        .or_else(|| {
+            Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .filter(|extension| extension.eq_ignore_ascii_case("lpk"))
+                .map(|_| path.to_string())
+        });
+    if let Some(lpk_path) = lpk_path {
+        ensure_extraction_cache(&lpk_path).map(|_| ())
+    } else {
+        Ok(())
+    }
+}
+
 /// Read a file from a virtual path such as `/tmp/model.lpk/model.model3.json`.
 /// No archive contents are written to disk.
 pub fn read_virtual_asset(path: &str) -> Result<Vec<u8>, String> {
     let (lpk_path, entry) = split_virtual_path(path).ok_or("Not an LPK virtual path")?;
 
-    // Debug builds keep a disk-backed extraction cache so repeated webview
-    // requests do not reopen and decrypt the workshop archive every time.
-    if cfg!(debug_assertions) {
-        if let Ok(cache_dir) = ensure_debug_cache(lpk_path) {
-            let cached = cache_entry_path(&cache_dir, entry)?;
-            if cached.is_file() {
-                return std::fs::read(cached).map_err(|e| e.to_string());
-            }
+    // Use the complete extraction cache in every build. The model path remains
+    // virtual and the cache is keyed by the archive content fingerprint.
+    if let Ok(cache_dir) = ensure_extraction_cache(lpk_path) {
+        let cached = cache_entry_path(&cache_dir, entry)?;
+        if cached.is_file() {
+            return std::fs::read(cached).map_err(|e| e.to_string());
         }
     }
 
@@ -82,7 +100,7 @@ pub fn read_virtual_asset(path: &str) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
-fn debug_cache_root() -> PathBuf {
+fn extraction_cache_root() -> PathBuf {
     if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
         return PathBuf::from(path).join("rive2d/lpk");
     }
@@ -123,9 +141,9 @@ fn marker_path(root: &Path) -> PathBuf {
     root.join(".complete")
 }
 
-fn ensure_debug_cache(lpk_path: &str) -> Result<PathBuf, String> {
+fn ensure_extraction_cache(lpk_path: &str) -> Result<PathBuf, String> {
     let fingerprint = archive_fingerprint(lpk_path)?;
-    let cache_paths = DEBUG_CACHE_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache_paths = EXTRACTION_CACHE_PATHS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(cache) = cache_paths.lock() {
         if let Some((cached_fingerprint, destination)) = cache.get(lpk_path) {
             if *cached_fingerprint == fingerprint && marker_path(destination).is_file() {
@@ -138,7 +156,7 @@ fn ensure_debug_cache(lpk_path: &str) -> Result<PathBuf, String> {
     // stale extractions from being reused after a Workshop file changes.
     let source = std::fs::read(lpk_path).map_err(|e| e.to_string())?;
     let key = format!("{:x}", md5::compute(&source));
-    let root = debug_cache_root();
+    let root = extraction_cache_root();
     let destination = root.join(&key);
     if marker_path(&destination).is_file() {
         return Ok(destination);
@@ -173,7 +191,7 @@ fn ensure_debug_cache(lpk_path: &str) -> Result<PathBuf, String> {
                 &data,
             )?;
         }
-        std::fs::write(marker_path(&temporary), b"rive2d-debug-cache-v1")
+        std::fs::write(marker_path(&temporary), b"rive2d-extraction-cache-v1")
             .map_err(|e| e.to_string())?;
         Ok::<(), String>(())
     })();
@@ -906,7 +924,7 @@ mod tests {
         }
 
         if cfg!(debug_assertions) {
-            let cache = ensure_debug_cache(&path).unwrap();
+            let cache = ensure_extraction_cache(&path).unwrap();
             assert!(marker_path(&cache).is_file());
             assert!(cache.join(".complete").is_file());
         }

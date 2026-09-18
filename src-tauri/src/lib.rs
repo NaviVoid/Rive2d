@@ -211,7 +211,8 @@ pub fn run() {
             get_model_names,
             get_custom_motions,
             trigger_motion,
-            js_log
+            js_log,
+            prepare_model_assets
         ]);
 
     // Manage the layer-shell window state (Linux only)
@@ -628,6 +629,11 @@ fn load_model(path: String) -> Result<String, String> {
         Some("json") => std::fs::read_to_string(path).map_err(|e| e.to_string()),
         _ => Err("Invalid model file format".to_string()),
     }
+}
+
+#[tauri::command]
+fn prepare_model_assets(path: String) -> Result<(), String> {
+    lpk::prepare_model_assets(&path)
 }
 
 #[tauri::command]
