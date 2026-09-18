@@ -152,6 +152,7 @@ export class ModelRuntime {
     isDragHitArea?: (hitAreaName: string) => boolean,
   ): readonly HitBoxPort[] {
     return this.graph.hitAreas.map(area => {
+      if (!area.enabled) return new HitBox(`hit:${area.name}`, area.name, area.order, []);
       const configuredRoute = resolveHitRoute?.(area.name);
       const route = configuredRoute === '__none__'
         ? null

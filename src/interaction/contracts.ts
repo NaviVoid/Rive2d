@@ -46,6 +46,11 @@ export interface HitAreaDefinition {
   readonly name: string;
   readonly id?: string;
   readonly motion?: string;
+  readonly pressAction?: string;
+  readonly releaseAction?: string;
+  readonly enterAction?: string;
+  readonly exitAction?: string;
+  readonly clickableWhenInvisible: boolean;
   readonly order: number;
   readonly enabled: boolean;
 }

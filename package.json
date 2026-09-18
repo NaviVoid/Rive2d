@@ -6,7 +6,8 @@
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build",
-    "typecheck": "vue-tsc --noEmit"
+    "typecheck": "vue-tsc --noEmit",
+    "test:interaction": "tsc --module commonjs --target ES2022 --moduleResolution node --outDir /tmp/rive2d-interaction-test --skipLibCheck scripts/interaction-tree.test.ts src/interaction/*.ts && node /tmp/rive2d-interaction-test/scripts/interaction-tree.test.js"
   },
   "dependencies": {
     "@pixi/sound": "^6.0.1",

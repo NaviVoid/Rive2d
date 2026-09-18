@@ -97,7 +97,6 @@ let hitMotionMap = {};
 let motionNameToIndex = {};  // { group: { name: arrayIndex } }
 let motionNextMap = {};      // { group: { arrayIndex: nextMtnString } }
 let fileLoopMap = {};        // { group: { arrayIndex: true } } — motions with FileLoop
-let pendingNextMtn = null;
 let idleGroup = null;         // name of Idle motion group (e.g. 'Idle', 'idle')
 let currentModelPath = null;
 let dragging = false;
@@ -111,17 +110,21 @@ let interactionSequence = 0;
 let dragInteractionId = null;
 let lastInteractionId = null;
 let motionRequestSequence = 0;
+let activeLayerMotionRequests = new Map(); // { layer: requestId }
+let motionCompletions = new Map(); // { requestId: completion }
+let boundMotionManagers = new WeakSet();
 let playingStart = false;     // true while start animation is playing
 let paramHitItems = [];      // ParamHit controller items parsed from model JSON
 let paramDragging = null;    // { hitArea, items: [{ item, startPos, paramIndex, startValue, currentValue }], hasMoved }
 let paramReleaseAnims = [];  // parameter reset animations after drag release
 let paramHitLocks = {};      // { paramIndex: { value } } — persistent ParamHit locks
-let virtualParamValues = {}; // ParamHit values for IDs absent from the MOC3
-let virtualScrubSessions = []; // Motion sessions used by virtual ParamHit rules
 let paramLoopItems = [];     // ParamLoop controller items: auto-oscillating parameters
 let dragHitNames = [];       // hit area names recorded on pointerdown for drag-motion detection
 let modelMotions = {};       // normalized motion groups from model metadata
 let hitAreaOrder = {};       // { hitAreaName: orderValue } from HitAreas[].Order for sorting
+let hitAreaActionMap = {};   // { hitAreaName: { click, press, release, enter, exit, clickableWhenInvisible } }
+let pressedHitAreas = [];
+let hoveredHitAreas = new Set();
 let stableHitAreaBounds = {}; // Initial bounds used when an action hides its hit-area drawable
 let stableModelSize = null;  // Last valid rendered model size for hidden/off-screen states
 let hitAreasEnabled = true;  // Model command state, independent of drawable visibility
@@ -134,11 +137,10 @@ let lockedParams = {};         // { paramId: { paramIndex, value, startTime, dur
 let lockedParts = {};          // { partId: { index, value } }
 let disabledMotionGroups = new Set();
 let disabledParamHitItems = new Set();
+let commandLockedParamHitItems = new Set();
 let intimacyValue = 50;
 let intimacyConfig = null;     // { initValue, minValue, maxValue }
-let currentMotionInfo = null;  // { group, index, entry }
 let playedMotions = new Set(); // for PreMtn tracking
-let deferredMotionStateActions = new Map(); // { `${group}:${index}`: { actions, lockState } }
 let leaveGroups = [];          // { group, interval, minDuration, maxDuration }
 let lastInteractionTime = 0;
 let leaveTimeout = null;
@@ -161,17 +163,28 @@ const live2DCommandRuntime = new Live2DCommandRuntime({
       const stored = varStore[value.substring(1)];
       return Number.isFinite(stored) ? stored : 0;
     }
+    if (value.startsWith('@') && currentModel) {
+      const cm = currentModel.internalModel.coreModel;
+      const index = getParameterIndexById(cm, value.substring(1));
+      return index >= 0 ? cm.getParameterValueByIndex(index) : 0;
+    }
     const parsed = Number(value);
     return Number.isFinite(parsed) ? parsed : 0;
   },
-  lockParameter(id, value, duration) {
+  lockParameter(id, value, _fadeInDuration) {
     if (!currentModel) return;
     const cm = currentModel.internalModel.coreModel;
     const index = getParameterIndexById(cm, id);
     if (index < 0 || index >= cm.getParameterCount()) return;
-    lockedParams[id] = { paramIndex: index, value, startTime: performance.now(), duration };
+    // Official `parameters lock` is persistent. Its optional duration is a
+    // fade-in duration, not a time-to-live for the lock.
+    lockedParams[id] = { paramIndex: index, value, startTime: performance.now(), duration: 0 };
   },
   unlockParameters(ids) {
+    if (ids.length === 0) {
+      lockedParams = {};
+      return;
+    }
     for (const id of ids) delete lockedParams[id];
   },
   setParameter(id, value) {
@@ -186,8 +199,13 @@ const live2DCommandRuntime = new Live2DCommandRuntime({
     const [group, index] = resolved.split(':');
     playMotion(group, index !== undefined ? parseInt(index) : undefined);
   },
-  stopMotions() {
-    currentModel?.internalModel.motionManager.stopAllMotions();
+  stopMotions(layer = 0) {
+    if (!currentModel) return;
+    if (layer <= 0) {
+      currentModel.internalModel.motionManager.stopAllMotions();
+      return;
+    }
+    currentModel.internalModel.parallelMotionManager?.[layer - 1]?.stopAllMotions();
   },
   setMouseTracking(enabled) {
     mouseTracking = enabled;
@@ -228,6 +246,10 @@ const live2DCommandRuntime = new Live2DCommandRuntime({
   setParamHitEnabled(id, enabled) {
     if (enabled) disabledParamHitItems.delete(id);
     else disabledParamHitItems.add(id);
+  },
+  setParamHitLocked(id, locked) {
+    if (locked) commandLockedParamHitItems.add(id);
+    else commandLockedParamHitItems.delete(id);
   },
   setHitAreasEnabled(enabled) {
     hitAreasEnabled = enabled;
@@ -288,6 +310,7 @@ const ready = app.init({
   // --- Drag: move & end (on stage to capture events outside model) ---
 
   app.stage.on('pointermove', (e) => {
+    if (currentModel) updateHitAreaHover(currentModel, e.global.x, e.global.y);
     if (dragActionActive && currentModel) {
       dragMoved = true;
       return;
@@ -356,6 +379,10 @@ const ready = app.init({
   });
 
   app.stage.on('pointerup', (e) => {
+    if (pressedHitAreas.length > 0) {
+      triggerHitAreaAction(pressedHitAreas, 'release');
+      pressedHitAreas = [];
+    }
     if (dragActionActive) {
       handleDragActionRelease('pointerup');
       return;
@@ -371,6 +398,10 @@ const ready = app.init({
   });
 
   app.stage.on('pointerupoutside', (e) => {
+    if (pressedHitAreas.length > 0) {
+      triggerHitAreaAction(pressedHitAreas, 'release');
+      pressedHitAreas = [];
+    }
     if (dragActionActive) {
       handleDragActionRelease('pointerupoutside');
       return;
@@ -386,6 +417,7 @@ const ready = app.init({
   });
 
   app.stage.on('pointercancel', () => {
+    pressedHitAreas = [];
     if (dragActionActive) {
       handleDragActionRelease('pointercancel');
       return;
@@ -510,21 +542,21 @@ listen('unload-model', async () => {
     motionNameToIndex = {};
     motionNextMap = {};
     fileLoopMap = {};
-    pendingNextMtn = null;
     idleGroup = null;
     playingStart = false;
     paramHitItems = [];
     paramDragging = null;
     paramReleaseAnims = [];
     paramHitLocks = {};
-    virtualParamValues = {};
-    virtualScrubSessions = [];
     paramLoopItems = [];
     dragActionActive = null;
     suppressNextTap = false;
     dragHitNames = [];
     modelMotions = {};
     hitAreaOrder = {};
+    hitAreaActionMap = {};
+    pressedHitAreas = [];
+    hoveredHitAreas = new Set();
     stableHitAreaBounds = {};
     stableModelSize = null;
     hitAreasEnabled = true;
@@ -536,9 +568,11 @@ listen('unload-model', async () => {
     lockedParts = {};
     disabledMotionGroups = new Set();
     disabledParamHitItems = new Set();
-    currentMotionInfo = null;
+    commandLockedParamHitItems = new Set();
     playedMotions = new Set();
-    deferredMotionStateActions = new Map();
+    activeLayerMotionRequests = new Map();
+    motionCompletions = new Map();
+    boundMotionManagers = new WeakSet();
     leaveGroups = [];
     if (leaveTimeout) { clearInterval(leaveTimeout); leaveTimeout = null; }
     leaveActive = false;
@@ -628,14 +662,6 @@ function getParamHitBounds(item, coreModel, paramIndex) {
   };
 }
 
-function getVirtualScrubProgress(state) {
-  const { item, currentValue } = state;
-  const { min, max } = getParamHitBounds(item, null, -1);
-  const range = max - min;
-  if (range <= 0) return 0;
-  return Math.max(0, Math.min(1, (currentValue - min) / range));
-}
-
 function clampModelPosition() {
   if (!currentModel) return;
   cacheStableModelSize(currentModel);
@@ -692,11 +718,6 @@ function updateParamHitState(state, value, coreModel) {
     min,
     Math.min(max, startValue + (state.targetValue - startValue) * item.weight),
   );
-  if (state.virtual) {
-    virtualParamValues[item.paramId] = state.currentValue;
-    state.scrubProgress = getVirtualScrubProgress(state);
-  }
-
   // Boundary actions fire when the value reaches a limit, not when the
   // pointer is released. Reset the latch after moving away so a later
   // crossing can fire again during the same interaction.
@@ -732,70 +753,15 @@ function updateParamHitState(state, value, coreModel) {
   }
 }
 
-async function startVirtualParamScrub(state) {
-  if (!state.virtual || !state.item.maxMtn || !currentModel) return;
-  const resolved = resolveMotionRef(state.item.maxMtn);
-  const [group, indexText] = resolved.split(':');
-  const index = indexText === undefined ? selectMotionIndex(group) : parseInt(indexText);
-  if (index === undefined || Number.isNaN(index)) return;
-
-  const manager = currentModel.internalModel.motionManager;
-  const motion = await manager.loadMotion(group, index);
-  if (!motion || !currentModel || !paramDragging?.items.includes(state)) return;
-
-  const queueManager = manager.queueManager;
-  const handle = queueManager?.startMotion?.(motion, false);
-  const queueEntry = handle !== undefined && handle !== -1
-    ? queueManager.getCubismMotionQueueEntry?.(handle)
-    : null;
-  if (!queueEntry) return;
-
-  // Remove the temporary queue entry before the next engine update. The
-  // motion is evaluated manually at the virtual parameter's scrub position.
-  queueEntry.setIsFinished?.(true);
-  queueEntry.setIsStarted?.(true);
-  queueEntry.setStartTime?.(0);
-  queueEntry.setFadeInStartTime?.(0);
-  state.scrubMotion = { group, index, motion, queueEntry };
-  virtualScrubSessions.push(state);
-  applyVirtualParamScrub(state);
-}
-
-function applyVirtualParamScrub(state) {
-  const session = state.scrubMotion;
-  if (!session || !currentModel) return;
-  const coreModel = currentModel.internalModel.coreModel;
-  const duration = Math.max(0, session.motion.getDuration?.() ?? 0);
-  const time = state.scrubProgress * duration;
-  try {
-    if (typeof session.motion.doUpdateParameters === 'function') {
-      session.motion.doUpdateParameters(coreModel, time, 1, session.queueEntry);
-    } else if (typeof session.motion.updateParamExe === 'function') {
-      session.motion.updateParamExe(currentModel, time * 1000, 1, session.queueEntry);
-    }
-  } catch (error) {
-    traceLog('motion', 'virtual-scrub-error', {
-      group: session.group,
-      index: session.index,
-      error: String(error),
-    });
-    state.scrubMotion = null;
-    virtualScrubSessions = virtualScrubSessions.filter(item => item !== state);
-  }
-}
-
 function applyReleaseCurve(progress, releaseType) {
   const t = Math.max(0, Math.min(1, progress));
-  switch (Number(releaseType)) {
-    case 1: // Slow Out
-      return 1 - (1 - t) ** 2;
-    case 2: // Fast Out
-      return t ** 2;
-    case 3: // Ease In Out
-      return t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2;
-    default: // Linear
-      return t;
+  // The official documentation defines ReleaseType as a return curve but does
+  // not publish a numeric serialization table. Do not invent curve meanings
+  // for numeric values from third-party model exports.
+  if (typeof releaseType === 'string' && releaseType.toLowerCase() === 'ease-in-out') {
+    return t < 0.5 ? 2 * t * t : 1 - ((-2 * t + 2) ** 2) / 2;
   }
+  return t;
 }
 
 // --- Border drawing ---
@@ -919,30 +885,7 @@ function cacheStableHitAreaBounds(model) {
 
 function hitTestModel(model, x, y) {
   if (!hitAreasEnabled) return [];
-  const hitNames = model.hitTest(x, y);
-  if (Object.keys(stableHitAreaBounds).length === 0) return hitNames;
-
-  const modelPoint = model.toModelPosition({ x, y }, { x: 0, y: 0 });
-  const internalModel = model.internalModel;
-  const fallbackHits = Object.entries(stableHitAreaBounds)
-    .filter(([name, bounds]) => {
-      if (hitNames.includes(name)) return false;
-      const hitArea = internalModel.hitAreas[name];
-      if (!hitArea) return false;
-      const drawIndex = hitArea.index >= 0
-        ? hitArea.index
-        : internalModel.getDrawableIndex(hitArea.id);
-      if (drawIndex < 0) return false;
-      return bounds.x <= modelPoint.x
-        && modelPoint.x <= bounds.x + bounds.width
-        && bounds.y <= modelPoint.y
-        && modelPoint.y <= bounds.y + bounds.height;
-    })
-    .map(([name]) => name);
-  if (fallbackHits.length > 0) {
-    traceLog('touch', 'stable-hit-fallback', { hitAreas: fallbackHits });
-  }
-  return [...new Set([...hitNames, ...fallbackHits])];
+  return model.hitTest(x, y);
 }
 
 // --- Right-click context menu ---
@@ -1222,6 +1165,14 @@ function normalizedControllerName(name) {
   return names[compact] || name;
 }
 
+function normalizeParamHitType(value) {
+  const text = String(value ?? '').toLowerCase();
+  if (text === 'drag') return 0;
+  if (text === 'stroke') return 1;
+  if (text === 'hold') return 2;
+  return finiteNumber(value, 0);
+}
+
 function normalizeControllerItem(item) {
   const normalized = { ...item };
   const fields = {
@@ -1286,8 +1237,17 @@ function normalizeModelMetadata(rawJson) {
   }
   const hitAreas = (rawJson.HitAreas || rawJson.hitAreas || rawJson.hit_areas || []).map(hitArea => ({
     ...hitArea,
-    Name: firstValue(hitArea, 'Name', 'name'), Motion: firstValue(hitArea, 'Motion', 'motion'),
-    Order: firstValue(hitArea, 'Order', 'order'), Enabled: firstValue(hitArea, 'Enabled', 'enabled'),
+    Name: firstValue(hitArea, 'Name', 'name'),
+    Id: firstValue(hitArea, 'ID', 'Id', 'id'),
+    ClickAction: firstValue(hitArea, 'ClickAction', 'clickAction', 'click_action', 'ClickMtn', 'clickMtn', 'click_mtn', 'Motion', 'motion'),
+    PressAction: firstValue(hitArea, 'PressAction', 'pressAction', 'press_action', 'PressMtn', 'pressMtn', 'press_mtn'),
+    ReleaseAction: firstValue(hitArea, 'ReleaseAction', 'releaseAction', 'release_action', 'ReleaseMtn', 'releaseMtn', 'release_mtn'),
+    EnterAction: firstValue(hitArea, 'EnterAction', 'enterAction', 'enter_action', 'EnterMtn', 'enterMtn', 'enter_mtn'),
+    ExitAction: firstValue(hitArea, 'ExitAction', 'exitAction', 'exit_action', 'ExitMtn', 'exitMtn', 'exit_mtn'),
+    ClickableWhenInvisible: firstValue(hitArea, 'ClickableWhenInvisible', 'clickableWhenInvisible', 'clickable_when_invisible'),
+    Motion: firstValue(hitArea, 'ClickAction', 'clickAction', 'click_action', 'ClickMtn', 'clickMtn', 'click_mtn', 'Motion', 'motion'),
+    Order: firstValue(hitArea, 'Sorting', 'sorting', 'Order', 'order'),
+    Enabled: firstValue(hitArea, 'Enabled', 'enabled'),
   }));
   const controllers = {};
   for (const [name, config] of Object.entries(rawJson.Controllers || rawJson.controllers || {})) {
@@ -1381,13 +1341,50 @@ function playMotionRef(ref, priority) {
 
 function buildHitMotionMap(hitAreas, customJson) {
   hitMotionMap = {};
+  hitAreaActionMap = {};
   hitAreaOrder = {};
   for (const hitArea of hitAreas) {
     if (!hitArea.Name || hitArea.Enabled === false) continue;
-    if (hitArea.Motion) hitMotionMap[hitArea.Name] = resolveMotionRef(hitArea.Motion);
+    const resolveAction = value => value ? resolveMotionRef(value) : null;
+    const actions = {
+      click: resolveAction(hitArea.ClickAction || hitArea.Motion),
+      press: resolveAction(hitArea.PressAction),
+      release: resolveAction(hitArea.ReleaseAction),
+      enter: resolveAction(hitArea.EnterAction),
+      exit: resolveAction(hitArea.ExitAction),
+      clickableWhenInvisible: hitArea.ClickableWhenInvisible === true || hitArea.ClickableWhenInvisible === 1 || hitArea.ClickableWhenInvisible === 'true',
+    };
+    hitAreaActionMap[hitArea.Name] = actions;
+    if (actions.click) hitMotionMap[hitArea.Name] = actions.click;
     if (hitArea.Order !== undefined) hitAreaOrder[hitArea.Name] = hitArea.Order;
   }
-  if (customJson) Object.assign(hitMotionMap, JSON.parse(customJson));
+  if (customJson) {
+    Object.assign(hitMotionMap, JSON.parse(customJson));
+    for (const [name, route] of Object.entries(hitMotionMap)) {
+      if (!hitAreaActionMap[name]) hitAreaActionMap[name] = {};
+      hitAreaActionMap[name].click = route;
+    }
+  }
+}
+
+function triggerHitAreaAction(names, eventType) {
+  for (const name of names) {
+    const route = hitAreaActionMap[name]?.[eventType];
+    if (!route || route === '__none__') continue;
+    traceLog('trigger', `hit-${eventType}`, { hitArea: name, motion: route });
+    playMotionRef(route);
+    return true;
+  }
+  return false;
+}
+
+function updateHitAreaHover(model, x, y) {
+  const current = new Set(sortHitNames(hitTestModel(model, x, y)).slice(0, 1));
+  const entered = [...current].filter(name => !hoveredHitAreas.has(name));
+  const exited = [...hoveredHitAreas].filter(name => !current.has(name));
+  if (entered.length > 0) triggerHitAreaAction(entered, 'enter');
+  if (exited.length > 0) triggerHitAreaAction(exited, 'exit');
+  hoveredHitAreas = current;
 }
 
 function sortHitNames(names) {
@@ -1397,24 +1394,15 @@ function sortHitNames(names) {
 
 function isDragHitArea(name) {
   if (!name) return false;
-  return /drag/i.test(name) || paramHitItems.some(item => item.hitArea === name);
+  return paramHitItems.some(item => item.hitArea === name && isParamHitItemEnabled(item));
 }
 
-// HitArea.Motion is an action/state route, not a progress-scrubbing instruction.
-function triggerDragMotions() {
-  for (const name of dragHitNames) {
-    if (!isDragHitArea(name)) continue;
-    if (paramHitItems.some(item => (
-      item.hitArea === name && !disabledParamHitItems.has(item.hitArea)
-    ))) continue;
-    const mapped = hitMotionMap[name];
-    if (mapped && mapped !== '__none__') {
-      console.log(`[motion] drag area action on ${name}: ${mapped}`);
-      playMotionRef(mapped);
-      return true;
-    }
-  }
-  return false;
+function isParamHitItemEnabled(item) {
+  return !disabledParamHitItems.has(item.name) && !disabledParamHitItems.has(item.hitArea);
+}
+
+function isParamHitItemLocked(item) {
+  return item.lockParam || commandLockedParamHitItems.has(item.name) || commandLockedParamHitItems.has(item.hitArea);
 }
 
 function motionShouldLoop(group, entry) {
@@ -1429,6 +1417,7 @@ function motionShouldLoop(group, entry) {
 
 function playMotion(group, index, priority) {
   if (!currentModel) return Promise.resolve(false);
+  const model = currentModel;
   group = findMotionGroup(group);
   if (disabledMotionGroups.has(group)) {
     console.log(`[motion] playMotion ${group} — skipped (group disabled)`);
@@ -1461,8 +1450,7 @@ function playMotion(group, index, priority) {
   // Track in playedMotions
   playedMotions.add(`${group}:${index}`);
 
-  // Queue NextMtn
-  pendingNextMtn = entry?.NextMtn || motionNextMap[group]?.[index] || null;
+  const nextMtn = entry?.NextMtn || motionNextMap[group]?.[index] || null;
 
   // Show speech bubble
   if (entry?.Text) showSpeechBubble(entry.Text, entry.TextDelay, entry.TextDuration);
@@ -1483,10 +1471,9 @@ function playMotion(group, index, priority) {
       executeCommand(entry.PostCommand);
       persistStateParameterLocks(entry, entry.PostCommand);
     }
-    // Follow NextMtn chain immediately for command-only entries
-    if (pendingNextMtn) {
-      const nextMtn = pendingNextMtn;
-      pendingNextMtn = null;
+    // Command-only entries have no motion-finish callback, so their explicit
+    // NextMtn chain is resolved synchronously.
+    if (nextMtn) {
       const resolved = resolveMotionRef(nextMtn);
       const [nextGroup, nextIdxStr] = resolved.split(':');
       playMotion(nextGroup, nextIdxStr !== undefined ? parseInt(nextIdxStr) : undefined);
@@ -1498,14 +1485,8 @@ function playMotion(group, index, priority) {
   const motionPriority = priority ?? (entry?.Priority ?? 2);
   const shouldLoop = motionShouldLoop(group, entry);
   const requestId = ++motionRequestSequence;
-  const motionKey = `${group}:${index}`;
+  const layer = motionLayer(group);
   const deferredLockState = holdDeferredStateLocks(deferredStateActions);
-  if (deferredStateActions.length > 0) {
-    deferredMotionStateActions.set(motionKey, {
-      actions: deferredStateActions,
-      lockState: deferredLockState,
-    });
-  }
 
   console.log(`[motion] playMotion ${group}:${index} priority=${motionPriority}`);
   traceLog('motion', 'request', {
@@ -1522,7 +1503,9 @@ function playMotion(group, index, priority) {
   // motion file's Meta.Loop value, which is true for many one-shot clips.
   const startMotion = () => {
     if (!currentModel) return Promise.resolve(false);
-    return currentModel.motion(group, index, motionPriority, { loop: shouldLoop });
+    const manager = motionManagerForLayer(model, layer);
+    bindMotionFinishListener(model, manager, layer);
+    return manager.startMotion(group, index, motionPriority, { loop: shouldLoop });
   };
   const resourceReady = entry?.File && index !== undefined && motionResourceCache
     ? motionResourceCache.load({ group, index })
@@ -1530,22 +1513,85 @@ function playMotion(group, index, priority) {
   const request = resourceReady.then(startMotion);
   return Promise.resolve(request).then(started => {
     traceLog('motion', 'request-result', { requestId, started });
+    if (started) {
+      activeLayerMotionRequests.set(layer, requestId);
+      if (!shouldLoop) {
+        motionCompletions.set(requestId, {
+          requestId,
+          group,
+          index,
+          entry,
+          nextMtn,
+          deferredStateActions,
+        });
+      }
+    }
     if (!started) {
-      const deferred = deferredMotionStateActions.get(motionKey);
-      if (deferred) restoreDeferredStateLocks(deferred.lockState);
-      deferredMotionStateActions.delete(motionKey);
+      restoreDeferredStateLocks(deferredLockState);
     }
     return Boolean(started);
   }).catch(error => {
     traceLog('motion', 'request-error', { requestId, error: String(error) });
-    const deferred = deferredMotionStateActions.get(motionKey);
-    if (deferred) restoreDeferredStateLocks(deferred.lockState);
-    deferredMotionStateActions.delete(motionKey);
+    restoreDeferredStateLocks(deferredLockState);
     return false;
   });
 }
 
-function scheduleMotionTransition(model, nextMtn) {
+function motionLayer(group) {
+  const match = String(group || '').match(/#(\d+)$/);
+  return match ? Number(match[1]) : 0;
+}
+
+function motionManagerForLayer(model, layer) {
+  if (layer <= 0) return model.internalModel.motionManager;
+  model.internalModel.extendParallelMotionManager(layer);
+  return model.internalModel.parallelMotionManager[layer - 1];
+}
+
+function bindMotionFinishListener(model, manager, layer) {
+  if (!manager || boundMotionManagers.has(manager)) return;
+  boundMotionManagers.add(manager);
+  manager.on('motionFinish', () => {
+    const requestId = activeLayerMotionRequests.get(layer);
+    if (requestId === undefined) return;
+    const completion = motionCompletions.get(requestId);
+    if (!completion) return;
+    completeMotion(model, completion);
+  });
+}
+
+function idleGroupForLayer(group) {
+  const layer = motionLayer(group);
+  const candidate = layer === 0 ? 'Idle' : `Idle#${layer}`;
+  const resolved = findMotionGroup(candidate);
+  return modelMotions[resolved] ? resolved : null;
+}
+
+function completeMotion(model, completion) {
+  if (currentModel !== model) return;
+  const { group, index, entry, nextMtn, deferredStateActions } = completion;
+  if (activeLayerMotionRequests.get(motionLayer(group)) !== completion.requestId) {
+    traceLog('motion', 'finish-ignored-interrupted', { group, index, requestId: completion.requestId });
+    return;
+  }
+  activeLayerMotionRequests.delete(motionLayer(group));
+  motionCompletions.delete(completion.requestId);
+  traceLog('motion', 'finish', {
+    group,
+    index,
+    name: entry?.Name,
+    file: entry?.File,
+    nextMtn,
+    fallbackIdle: !nextMtn && Boolean(idleGroupForLayer(group)),
+  });
+  playingStart = false;
+  applyDeferredStateActions(deferredStateActions);
+  persistStateParameterLocks(entry, entry?.Command);
+  if (entry?.PostCommand) executeCommand(entry.PostCommand);
+  scheduleMotionTransition(model, nextMtn, group);
+}
+
+function scheduleMotionTransition(model, nextMtn, completedGroup) {
   let attempts = 0;
   const run = () => {
     if (currentModel !== model) return;
@@ -1577,20 +1623,20 @@ function scheduleMotionTransition(model, nextMtn) {
       const [group, idxStr] = resolved.split(':');
       traceLog('motion', 'finish-transition', { type: 'NextMtn', nextMtn: resolved });
       request = playMotion(group, idxStr !== undefined ? parseInt(idxStr) : undefined);
-    } else if (idleGroup) {
+    } else {
+      const layerIdleGroup = idleGroupForLayer(completedGroup);
+      if (!layerIdleGroup) return;
       isIdleTransition = true;
-      const idleIndex = selectIdleMotionIndex(idleGroup);
+      const idleIndex = selectIdleMotionIndex(layerIdleGroup);
       traceLog('motion', 'finish-transition', {
         type: 'Idle',
-        group: idleGroup,
+        group: layerIdleGroup,
         index: idleIndex,
         idleState: getStateValue('idle'),
       });
       request = idleIndex === undefined
         ? Promise.resolve(false)
-        : playMotion(idleGroup, idleIndex, 1);
-    } else {
-      return;
+        : playMotion(layerIdleGroup, idleIndex, 1);
     }
 
     Promise.resolve(request).then(started => {
@@ -1673,10 +1719,52 @@ function getParameterIndexById(coreModel, parameterId) {
 
 // --- VarFloats system ---
 
+function isVarFloatCondition(vf) {
+  return vf.Type === 1 || String(vf.Type || '').toLowerCase() === 'condition';
+}
+
+function isVarFloatAction(vf) {
+  return vf.Type === 2 || String(vf.Type || '').toLowerCase() === 'action';
+}
+
+function resolveVarFloatValue(raw) {
+  const value = String(raw ?? '').trim();
+  if (value.startsWith('$')) return varStore[value.slice(1)] ?? 0;
+  if (value.startsWith('@') && currentModel) {
+    const coreModel = currentModel.internalModel.coreModel;
+    const index = getParameterIndexById(coreModel, value.slice(1));
+    return index >= 0 ? coreModel.getParameterValueByIndex(index) : 0;
+  }
+  const random = value.match(/^rand(f)?\(\s*(-?(?:\d+\.?\d*|\.\d+))\s*,\s*(-?(?:\d+\.?\d*|\.\d+))\s*\)$/i);
+  if (random) {
+    const min = Number(random[2]);
+    const max = Number(random[3]);
+    const sample = min + Math.random() * (max - min);
+    return random[1] ? sample : Math.floor(sample);
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function applyVarFloatOperation(current, operation, target) {
+  switch (operation) {
+    case 'assign': return target;
+    case 'add': return current + target;
+    case 'subtract': return current - target;
+    case 'multiply': return current * target;
+    case 'divide': return target === 0 ? current : current / target;
+    case 'round': {
+      const factor = 10 ** Math.max(0, Math.floor(target));
+      return Math.round(current * factor) / factor;
+    }
+    default: return current;
+  }
+}
+
 function checkVarFloatConditions(entry) {
   if (!entry.VarFloats) return true;
   for (const vf of entry.VarFloats) {
-    if (vf.Type !== 1) continue; // Type 1 = condition
+    if (!isVarFloatCondition(vf)) continue;
     const name = vf.Name;
     const code = vf.Code || '';
     let value;
@@ -1689,15 +1777,15 @@ function checkVarFloatConditions(entry) {
     } else {
       value = varStore[name] ?? 0;
     }
-    const parts = code.split(/\s+/);
-    const op = parts[0].toLowerCase();
-    const target = parseFloat(parts[1]) || 0;
+    const parts = code.trim().split(/\s+/);
+    const op = parts[0]?.toLowerCase();
+    const target = resolveVarFloatValue(parts.slice(1).join(' '));
     if (op === 'equal' && value !== target) return false;
     if (op === 'not_equal' && value === target) return false;
-    if ((op === 'greater' || op === 'upper') && value <= target) return false;
-    if ((op === 'less' || op === 'lower') && value >= target) return false;
-    if ((op === 'greater_equal' || op === 'upper_equal') && value < target) return false;
-    if ((op === 'less_equal' || op === 'lower_equal') && value > target) return false;
+    if (op === 'greater' && value <= target) return false;
+    if (op === 'lower' && value >= target) return false;
+    if (op === 'greater_equal' && value < target) return false;
+    if (op === 'lower_equal' && value > target) return false;
   }
   return true;
 }
@@ -1712,7 +1800,7 @@ function getDeferredStateActions(entry) {
   if (lockValues.size === 0) return [];
 
   return entry.VarFloats.filter(vf => {
-    if (vf.Type !== 2 || !vf.Name) return false;
+    if (!isVarFloatAction(vf) || !vf.Name) return false;
     const parts = (vf.Code || '').trim().split(/\s+/);
     if (parts[0]?.toLowerCase() !== 'assign' || !Number.isFinite(parseFloat(parts[1]))) return false;
     const parameterId = vf.Name.startsWith('@') ? vf.Name.substring(1) : vf.Name;
@@ -1748,25 +1836,30 @@ function applyVarFloatActions(entry, deferredActions = []) {
   if (!entry.VarFloats) return;
   const deferred = new Set(deferredActions);
   for (const vf of entry.VarFloats) {
-    if (vf.Type !== 2) continue; // Type 2 = action
+    if (!isVarFloatAction(vf)) continue;
     if (deferred.has(vf)) continue;
     const name = vf.Name;
     const code = vf.Code || '';
     const parts = code.split(/\s+/);
-    const op = parts[0];
-    const target = parseFloat(parts[1]) || 0;
+    const op = parts[0]?.toLowerCase();
+    const target = resolveVarFloatValue(parts.slice(1).join(' '));
     if (name && name.startsWith('@') && currentModel) {
       const paramId = name.substring(1);
       const cm = currentModel.internalModel.coreModel;
       const idx = getParameterIndexById(cm, paramId);
       const count = cm.getParameterCount();
       if (idx >= 0 && idx < count) {
-        if (op === 'assign' || op === 'init') cm.setParameterValueByIndex(idx, target);
-        else if (op === 'add') cm.setParameterValueByIndex(idx, cm.getParameterValueByIndex(idx) + target);
+        const current = cm.getParameterValueByIndex(idx);
+        const next = op === 'init' ? target : applyVarFloatOperation(current, op, target);
+        cm.setParameterValueByIndex(idx, next);
+        syncInteractionParameter(paramId, next);
       }
     } else {
-      if (op === 'assign' || op === 'init') varStore[name] = target;
-      else if (op === 'add') varStore[name] = (varStore[name] ?? 0) + target;
+      if (!name || (op === 'init' && Object.hasOwn(varStore, name))) continue;
+      const current = varStore[name] ?? 0;
+      const next = op === 'init' ? target : applyVarFloatOperation(current, op, target);
+      varStore[name] = next;
+      syncInteractionVariable(name, next);
     }
   }
 }
@@ -1777,13 +1870,25 @@ function applyDeferredStateActions(actions) {
     const target = parseFloat(parts[1]);
     if (!action.Name || parts[0]?.toLowerCase() !== 'assign' || !Number.isFinite(target)) continue;
     const parameterId = action.Name.startsWith('@') ? action.Name.substring(1) : action.Name;
-    if (!action.Name.startsWith('@')) varStore[action.Name] = target;
+    if (!action.Name.startsWith('@')) {
+      varStore[action.Name] = target;
+      syncInteractionVariable(action.Name, target);
+    }
     if (!currentModel) continue;
     const cm = currentModel.internalModel.coreModel;
     const index = getParameterIndexById(cm, parameterId);
     if (index >= 0 && index < cm.getParameterCount()) cm.setParameterValueByIndex(index, target);
+    if (action.Name.startsWith('@')) syncInteractionParameter(parameterId, target);
     traceLog('motion', 'deferred-state-commit', { parameter: parameterId, value: target });
   }
+}
+
+function syncInteractionVariable(name, value) {
+  if (modelRuntime && name && Number.isFinite(value)) modelRuntime.state.setVariable(name, value);
+}
+
+function syncInteractionParameter(name, value) {
+  if (modelRuntime && name && Number.isFinite(value)) modelRuntime.state.setParameter(name, value);
 }
 
 function getStateValue(name) {
@@ -1969,8 +2074,7 @@ function triggerParamHitMotions(states, property, label) {
   for (const state of states) {
     const ref = state.item?.[property] || state[property];
     if (!ref) continue;
-    const priority = state.item?.lowPriority ? 1 : undefined;
-    if (!refs.has(ref) || priority === 1) refs.set(ref, priority);
+    if (!refs.has(ref)) refs.set(ref, undefined);
   }
   for (const [ref, priority] of refs) {
     traceLog('trigger', `param-${label.toLowerCase()}`, {
@@ -2003,25 +2107,9 @@ function handleParamHitRelease(reason = 'release') {
     const moved = Math.abs(currentValue - startValue);
     console.log(`[touch] ParamHit release on ${hitArea}: ${item.paramId}=${currentValue.toFixed(3)}, moved=${moved.toFixed(3)}, range=[${min},${max}]`);
 
-    if (state.virtual) {
-      const outside = reason === 'pointerupoutside';
-      const keep = !outside && (item.lockParam || item.releaseType >= 2);
-      state.currentValue = outside ? max : keep ? currentValue : min;
-      state.targetValue = state.currentValue;
-      state.scrubProgress = getVirtualScrubProgress(state);
-      virtualParamValues[item.paramId] = state.currentValue;
-      applyVirtualParamScrub(state);
-      if (!keep) {
-        virtualScrubSessions = virtualScrubSessions.filter(candidate => candidate !== state);
-        state.scrubMotion = null;
-      }
-      if (!state.maxReached && !state.minReached && item.endMtn) endStates.push(state);
-      continue;
-    }
-
     // LockParam is the persistence switch. ReleaseType is only metadata for
     // the return curve and must not decide whether a return happens.
-    if (item.lockParam) {
+    if (isParamHitItemLocked(item)) {
       paramReleaseAnims = paramReleaseAnims.filter(anim => anim.paramIndex !== paramIndex);
       paramHitLocks[paramIndex] = { value: currentValue };
       traceLog('touch', 'param-release-lock', {
@@ -2100,12 +2188,13 @@ async function loadModel(modelPath) {
   paramDragging = null;
   paramReleaseAnims = [];
   paramHitLocks = {};
-  virtualParamValues = {};
-  virtualScrubSessions = [];
   paramHitItems = [];
   paramLoopItems = [];
   dragActionActive = null;
   suppressNextTap = false;
+  pressedHitAreas = [];
+  hoveredHitAreas = new Set();
+  hitAreaActionMap = {};
   // Reset feature state
   motionEntryMap = {};
   varStore = {};
@@ -2113,9 +2202,11 @@ async function loadModel(modelPath) {
   lockedParts = {};
   disabledMotionGroups = new Set();
   disabledParamHitItems = new Set();
-  currentMotionInfo = null;
+  commandLockedParamHitItems = new Set();
   playedMotions = new Set();
-  deferredMotionStateActions = new Map();
+  activeLayerMotionRequests = new Map();
+  motionCompletions = new Map();
+  boundMotionManagers = new WeakSet();
   leaveGroups = [];
   if (leaveTimeout) { clearInterval(leaveTimeout); leaveTimeout = null; }
   leaveActive = false;
@@ -2232,13 +2323,16 @@ async function loadModel(modelPath) {
       suppressNextTap = false;
       dragMoved = false;
 
+      cacheStableHitAreaBounds(model);
+      pressedHitAreas = sortHitNames(hitTestModel(model, e.global.x, e.global.y)).slice(0, 1);
+      const pressActionConsumed = triggerHitAreaAction(pressedHitAreas, 'press');
+
       // Check for ParamHit drag areas first
       if (paramHitItems.length > 0) {
-        cacheStableHitAreaBounds(model);
-        const hitNames = sortHitNames(hitTestModel(model, e.global.x, e.global.y));
+        const hitNames = pressedHitAreas;
         for (const name of hitNames) {
           const items = paramHitItems.filter(item =>
-            item.hitArea === name && !disabledParamHitItems.has(item.hitArea),
+            item.hitArea === name && isParamHitItemEnabled(item),
           );
           if (items.length > 0) {
             console.log(`[touch] pointerdown on ParamHit area: ${name} (params: ${items.map(item => item.paramId).join(', ')})`);
@@ -2270,14 +2364,10 @@ async function loadModel(modelPath) {
               pointerId: e.pointerId,
               hitArea: name,
               items: items.map(item => {
-                const virtual = item.paramIndex < 0;
-                const startValue = virtual
-                  ? (virtualParamValues[item.paramId] ?? 0)
-                  : coreModel.getParameterValueByIndex(item.paramIndex);
-                if (!virtual) delete paramHitLocks[item.paramIndex];
+                const startValue = coreModel.getParameterValueByIndex(item.paramIndex);
+                delete paramHitLocks[item.paramIndex];
                 return {
                   item,
-                  virtual,
                   startPos: item.axis === 0 ? e.global.x : e.global.y,
                   lastPos: item.axis === 0 ? e.global.x : e.global.y,
                   paramIndex: item.paramIndex,
@@ -2288,10 +2378,6 @@ async function loadModel(modelPath) {
                   lastUpdateTime: performance.now(),
                   maxReached: false,
                   minReached: false,
-                  scrubProgress: virtual ? getVirtualScrubProgress({
-                    item,
-                    currentValue: startValue,
-                  }) : 0,
                 };
               }),
               hasMoved: false,
@@ -2305,19 +2391,13 @@ async function loadModel(modelPath) {
             dragStart.y = e.global.y;
             setFullInputRegion();
             triggerParamHitMotions(paramDragging.items, 'beginMtn', 'BeginMtn');
-            for (const state of paramDragging.items) {
-              if (state.virtual) {
-                startVirtualParamScrub(state).catch((error) => {
-                  traceLog('motion', 'virtual-scrub-load-error', { error: String(error) });
-                });
-              }
-            }
             return;
           }
         }
       }
 
-      // Start an explicit action/state route for non-ParamHit drag areas.
+      // A declared press action owns the gesture. A click action remains a
+      // pointer-tap route; names such as TouchDrag do not change that rule.
       const interactionId = ++interactionSequence;
       lastInteractionId = interactionId;
       cacheStableHitAreaBounds(model);
@@ -2325,8 +2405,7 @@ async function loadModel(modelPath) {
       dragInteractionId = interactionId;
       dragStart.x = e.global.x;
       dragStart.y = e.global.y;
-      const dragMotionConsumed = modelRuntime?.handleHit('down', dragHitNames, e.button)
-        || triggerDragMotions();
+      const dragMotionConsumed = pressActionConsumed;
 
       traceLog('touch', 'model-down', {
         interactionId,
@@ -2380,12 +2459,10 @@ async function loadModel(modelPath) {
       // PostCommand and NextMtn side effects until the native TS player lands.
       executeCommands: false,
       resolveHitRoute: name => hitMotionMap[name],
-      isDragHitArea,
+      isDragHitArea: () => false,
       dispatchMotion: (route, options) => playMotion(route.group, route.index, options?.priority),
     });
     appRuntime.attachModel(modelRuntime);
-    pendingNextMtn = null;
-
     // Parse controllers
     const controllers = metadata.controllers;
 
@@ -2408,13 +2485,22 @@ async function loadModel(modelPath) {
         const paramId = item.Id;
         const rawIdx = getParameterIndexById(coreModel, paramId);
         const paramIndex = rawIdx >= 0 && rawIdx < paramCount ? rawIdx : -1;
+        if (paramIndex < 0) {
+          traceLog('controller', 'param-hit-skipped-missing-parameter', {
+            hitArea: item.HitArea,
+            parameter: paramId,
+          });
+          console.warn(`[controller] ParamHit skipped: parameter not found (${paramId})`);
+          continue;
+        }
         paramHitItems.push({
           hitArea: item.HitArea,
+          name: item.Name || item.HitArea,
           paramId,
-          paramIndex, // -1 if parameter doesn't exist in moc3
+          paramIndex,
           axis: finiteNumber(item.Axis, 0),
           factor: finiteNumber(item.Factor, 0.04),
-          type: finiteNumber(item.Type, 0),
+          type: normalizeParamHitType(item.Type),
           weight: finiteNumber(item.Weight, 1),
           minValue: item.MinValue,
           maxValue: item.MaxValue,
@@ -2601,12 +2687,9 @@ async function loadModel(modelPath) {
               );
             }
           }
-          if (!state.virtual) {
-            cm.setParameterValueByIndex(state.paramIndex, state.currentValue);
-          }
+          cm.setParameterValueByIndex(state.paramIndex, state.currentValue);
         }
       }
-      for (const state of virtualScrubSessions) applyVirtualParamScrub(state);
       for (const anim of paramReleaseAnims) {
         anim.t = Math.min(1, anim.t + (anim.speed || 0.05));
         const v = anim.from + (anim.target - anim.from) * applyReleaseCurve(anim.t, anim.releaseType);
@@ -2660,7 +2743,7 @@ async function loadModel(modelPath) {
         for (const loop of paramLoopItems) {
           // Skip if this param is being dragged with LockParam
           if (paramDragging?.items.some(state =>
-            state.item.lockParam && state.paramIndex === loop.paramIndex,
+            isParamHitItemLocked(state.item) && state.paramIndex === loop.paramIndex,
           )) continue;
           const elapsed = now - loop.startTime;
           const phase = (elapsed % loop.duration) / loop.duration; // 0..1
@@ -2705,61 +2788,6 @@ async function loadModel(modelPath) {
       if (entry?.FadeOut !== undefined) motion.setFadeOutTime(entry.FadeOut / 1000);
     });
 
-    // Track current motion via motionStart event
-    model.internalModel.motionManager.on('motionStart', (group, index) => {
-      const entry = motionEntryMap[group]?.[index];
-      const motionKey = `${group}:${index}`;
-      const deferred = deferredMotionStateActions.get(motionKey);
-      currentMotionInfo = {
-        group,
-        index,
-        entry,
-        deferredStateActions: deferred?.actions || [],
-      };
-      deferredMotionStateActions.delete(motionKey);
-      traceLog('motion', 'start', {
-        group,
-        index,
-        name: entry?.Name,
-        file: entry?.File,
-        priority: entry?.Priority,
-      });
-    });
-
-    // NextMtn chaining + PostCommand: when a motion finishes
-    model.internalModel.motionManager.on('motionFinish', () => {
-      traceLog('motion', 'finish', {
-        group: currentMotionInfo?.group,
-        index: currentMotionInfo?.index,
-        name: currentMotionInfo?.entry?.Name,
-        file: currentMotionInfo?.entry?.File,
-        nextMtn: pendingNextMtn,
-        fallbackIdle: !pendingNextMtn && Boolean(idleGroup),
-      });
-      playingStart = false;
-
-      // Execute PostCommand from the finished motion
-      if (currentMotionInfo?.entry) {
-        applyDeferredStateActions(currentMotionInfo.deferredStateActions);
-        // A completed state action may assign a parameter through VarFloats
-        // and lock the same parameter through Command. Persist only explicit
-        // assignments; additive counters remain duration-bound.
-        persistStateParameterLocks(currentMotionInfo.entry, currentMotionInfo.entry.Command);
-      }
-      if (currentMotionInfo?.entry?.PostCommand) {
-        executeCommand(currentMotionInfo.entry.PostCommand);
-      }
-      const nextMtn = pendingNextMtn;
-      pendingNextMtn = null;
-      currentMotionInfo = null;
-
-      // Wait for the motion audio and manager reservation to settle before
-      // starting NextMtn/Idle. TouchSpecial includes a sound in this model.
-      // Completion and reset are only valid when explicitly declared by the
-      // model through PostCommand or NextMtn; action names are not semantics.
-      scheduleMotionTransition(model, nextMtn);
-    });
-
     model.on('pointertap', (e) => {
       lastInteractionTime = Date.now();
       traceLog('touch', 'tap', {
@@ -2797,16 +2825,12 @@ async function loadModel(modelPath) {
       }
       // The TypeScript interaction runtime owns JSON-defined routes. Keep
       // custom mappings and legacy fallbacks below for compatibility.
-      if (modelRuntime && modelRuntime.handleHit('tap', hitAreaNames, e.button)) {
+      const targetHitAreas = hitAreaNames.slice(0, 1);
+      if (modelRuntime && modelRuntime.handleHit('tap', targetHitAreas, e.button)) {
         console.log('[touch] pointertap — handled by interaction runtime');
         return;
       }
-      const dragHitName = hitAreaNames.find(name => isDragHitArea(name));
-      if (dragHitName) {
-        console.log(`[touch] ${dragHitName}: skipped (drag hit area consumed tap)`);
-        return;
-      }
-      for (const name of hitAreaNames) {
+      for (const name of targetHitAreas) {
         const mapped = hitMotionMap[name];
         // Custom override: __none__ means do nothing
         if (mapped === '__none__') { console.log(`[touch] ${name}: skipped (__none__)`); continue; }

@@ -123,9 +123,14 @@ export class JsonModelGraphBuilder {
       const area = record(item);
       return {
         name: text(area, 'Name', 'name') ?? '',
-        id: text(area, 'Id', 'id'),
-        motion: text(area, 'Motion', 'motion'),
-        order: number(area, 0, 'Order', 'order'),
+        id: text(area, 'ID', 'Id', 'id'),
+        motion: text(area, 'ClickAction', 'clickAction', 'click_action', 'ClickMtn', 'clickMtn', 'Motion', 'motion'),
+        pressAction: text(area, 'PressAction', 'pressAction', 'press_action', 'PressMtn', 'pressMtn'),
+        releaseAction: text(area, 'ReleaseAction', 'releaseAction', 'release_action', 'ReleaseMtn', 'releaseMtn'),
+        enterAction: text(area, 'EnterAction', 'enterAction', 'enter_action', 'EnterMtn', 'enterMtn'),
+        exitAction: text(area, 'ExitAction', 'exitAction', 'exit_action', 'ExitMtn', 'exitMtn'),
+        clickableWhenInvisible: bool(area, false, 'ClickableWhenInvisible', 'clickableWhenInvisible', 'clickable_when_invisible'),
+        order: number(area, 0, 'Sorting', 'sorting', 'Order', 'order'),
         enabled: bool(area, true, 'Enabled', 'enabled'),
       } satisfies HitAreaDefinition;
     }).filter(area => area.name.length > 0) : [];

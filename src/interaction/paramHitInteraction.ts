@@ -44,14 +44,6 @@ export class ParamHitInteraction extends ParameterInteraction {
   }
 }
 
-export class VirtualParamHitInteraction extends ParameterInteraction {
-  readonly id: string;
-  constructor(hitBoxName: string, target: ParameterTarget) {
-    super(hitBoxName, target);
-    this.id = `virtual-param-hit:${hitBoxName}:${target.id}`;
-  }
-}
-
 class ParameterSession implements InteractionSession {
   constructor(
     readonly id: string,
